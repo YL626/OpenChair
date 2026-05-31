@@ -35,5 +35,5 @@ These tools will be used later in the development process so we will install the
 - Kubernetes
 
 # Authors
- Alan De Lira
+ Alan De Lira\
  Kacper Mazur
