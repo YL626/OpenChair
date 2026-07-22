@@ -19,7 +19,6 @@ Before starting development, contributors should ensure they have
 - Install the following VSCode Extensions (if on vscode)
 	- ESLint
 	- Prettier
-	- Code formatter
 	- Prisma
 	- Tailwind CSS IntelliSense
 	- PostgreSQL or SQLTools
