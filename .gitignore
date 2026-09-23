@@ -1,2 +1,11 @@
 CS370-TermProject.pdf
 
+build/
+*.o
+*.a
+*.so
+*.swp
+*~
+.claude/
+.vscode/
+.DS_Store
