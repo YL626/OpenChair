@@ -476,9 +476,41 @@ Do not allow soak logs to grow without bound.
 
 
 
+## Software-first development and simulation
+
+Development and automated testing may run on WSL2/Linux without
+
+physical hardware, using simulated optical and VL6180X distance inputs.
+
+Simulated and real sensor adapters must feed the same C23 analysis
+
+interfaces. There must be no separate diagnostic logic for simulation.
+
+All results and logs must distinguish SIMULATED/REPLAYED inputs from
+
+LIVE hardware measurements. Never claim hardware verification from
+
+simulation.
+
+M2/M3 live-sensor requirements and the final 48-hour unattended
+
+live-hardware soak cannot be satisfied by simulated input alone.
+
+
+
 ## Build and test commands
 
 TODO: replace these with real commands once repository layout exists.
+
+The Makefile targets all, test, asan, memcheck, run, and soakcheck are
+
+placeholders that only print a "not implemented" message. Only clean is
+
+functional (it removes build/).
+
+`make deploy` is not implemented yet (no such target exists). Never treat
+
+a placeholder target's exit code 0 as successful verification.
 
 Build:
 
@@ -759,6 +791,15 @@ REFLECTION.md
 README.md
 
     clean-Pi setup, build, deploy, and run instructions
+
+Each team member keeps their own PROMPTLOG.md and REFLECTION.md in a
+
+personal folder. These files stay in these folders and are not moved:
+
+    YL626/PROMPTLOG.md
+    YL626/REFLECTION.md
+    kacperm37/PROMPTLOG.md
+    kacperm37/REFLECTION.md
 
 Do not turn CLAUDE.md into DESIGN.md.
 
