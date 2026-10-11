@@ -45,6 +45,10 @@ Mechanisms E (multiprocess fault isolation) and D (custom crash-consistent stora
 ├── Makefile              # placeholder targets (see below)
 ├── README.md
 ├── .gitignore
+├── src/                  # C23 systems implementation
+├── include/              # public/shared C headers
+├── tests/                # automated tests
+│   └── fixtures/         # simulated/replayed sensor data
 ├── YL626/
 │   ├── PROMPTLOG.md
 │   └── REFLECTION.md
