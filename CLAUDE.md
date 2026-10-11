@@ -208,7 +208,13 @@ At least two mechanisms from CS370 Section 3.2 must be implemented by us,
 
 explicitly justified, and quantitatively measured.
 
-Current candidates:
+Current provisional selection: Mechanisms E + D.
+
+This direction was selected by the architecture lead and is pending
+
+Kacper's confirmation. Final confirmation and mechanism mapping will be
+
+recorded in DESIGN.md.
 
 ### Mechanism E — multi-process architecture
 
@@ -232,9 +238,7 @@ Requirements:
 
 - no orphaned file descriptors across restart
 
-### Second mechanism — NOT YET FROZEN
-
-Primary candidates:
+### Second mechanism — D (provisional, pending Kacper's confirmation)
 
 D — custom storage layer
 
@@ -246,15 +250,11 @@ D — custom storage layer
 
 - recovery after interrupted write/power loss
 
-or
+Mechanism B (interrupt-driven input versus polling) was previously
 
-B — interrupt-driven input
+considered as the alternative. It is not part of the current
 
-- implement interrupt/event-driven path
-
-- implement polling comparison
-
-- measure CPU utilization and event latency for both
+implementation plan unless the team changes the selection.
 
 Do not silently choose or replace a graded mechanism.
 
@@ -827,7 +827,8 @@ forcing a diagnosis.
 
 ## Current unresolved decisions
 
-- exact second graded OS mechanism: D or B
+- confirmation of provisional mechanism pair E + D (pending Kacper; B was
+  previously considered and is not in the current plan)
 
 - final ALS-PT19 / ADS1115 sampling rate, gain, calibration, and optical-shroud geometry
 
