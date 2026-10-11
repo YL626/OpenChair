@@ -208,7 +208,13 @@ At least two mechanisms from CS370 Section 3.2 must be implemented by us,
 
 explicitly justified, and quantitatively measured.
 
-Current candidates:
+Current provisional selection: Mechanisms E + D.
+
+This direction was selected by the architecture lead and is pending
+
+Kacper's confirmation. Final confirmation and mechanism mapping will be
+
+recorded in DESIGN.md.
 
 ### Mechanism E — multi-process architecture
 
@@ -232,9 +238,7 @@ Requirements:
 
 - no orphaned file descriptors across restart
 
-### Second mechanism — NOT YET FROZEN
-
-Primary candidates:
+### Second mechanism — D (provisional, pending Kacper's confirmation)
 
 D — custom storage layer
 
@@ -246,15 +250,11 @@ D — custom storage layer
 
 - recovery after interrupted write/power loss
 
-or
+Mechanism B (interrupt-driven input versus polling) was previously
 
-B — interrupt-driven input
+considered as the alternative. It is not part of the current
 
-- implement interrupt/event-driven path
-
-- implement polling comparison
-
-- measure CPU utilization and event latency for both
+implementation plan unless the team changes the selection.
 
 Do not silently choose or replace a graded mechanism.
 
@@ -476,9 +476,41 @@ Do not allow soak logs to grow without bound.
 
 
 
+## Software-first development and simulation
+
+Development and automated testing may run on WSL2/Linux without
+
+physical hardware, using simulated optical and VL6180X distance inputs.
+
+Simulated and real sensor adapters must feed the same C23 analysis
+
+interfaces. There must be no separate diagnostic logic for simulation.
+
+All results and logs must distinguish SIMULATED/REPLAYED inputs from
+
+LIVE hardware measurements. Never claim hardware verification from
+
+simulation.
+
+M2/M3 live-sensor requirements and the final 48-hour unattended
+
+live-hardware soak cannot be satisfied by simulated input alone.
+
+
+
 ## Build and test commands
 
 TODO: replace these with real commands once repository layout exists.
+
+The Makefile targets all, test, asan, memcheck, run, and soakcheck are
+
+placeholders that only print a "not implemented" message. Only clean is
+
+functional (it removes build/).
+
+`make deploy` is not implemented yet (no such target exists). Never treat
+
+a placeholder target's exit code 0 as successful verification.
 
 Build:
 
@@ -760,6 +792,15 @@ README.md
 
     clean-Pi setup, build, deploy, and run instructions
 
+Each team member keeps their own PROMPTLOG.md and REFLECTION.md in a
+
+personal folder. These files stay in these folders and are not moved:
+
+    YL626/PROMPTLOG.md
+    YL626/REFLECTION.md
+    kacperm37/PROMPTLOG.md
+    kacperm37/REFLECTION.md
+
 Do not turn CLAUDE.md into DESIGN.md.
 
 Detailed design rationale belongs in DESIGN.md.
@@ -786,7 +827,8 @@ forcing a diagnosis.
 
 ## Current unresolved decisions
 
-- exact second graded OS mechanism: D or B
+- confirmation of provisional mechanism pair E + D (pending Kacper; B was
+  previously considered and is not in the current plan)
 
 - final ALS-PT19 / ADS1115 sampling rate, gain, calibration, and optical-shroud geometry
 
