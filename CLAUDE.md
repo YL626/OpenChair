@@ -500,45 +500,47 @@ live-hardware soak cannot be satisfied by simulated input alone.
 
 ## Build and test commands
 
-TODO: replace these with real commands once repository layout exists.
+The Makefile builds natively on Linux/WSL2 with GCC. The only program is a
 
-The Makefile targets all, test, asan, memcheck, run, and soakcheck are
+scaffold CLI, not the application; passing targets verify the toolchain
 
-placeholders that only print a "not implemented" message. Only clean is
+and scaffold only, never hardware behavior.
 
-functional (it removes build/).
+Build (builds the scaffold application into build/plain/):
 
-`make deploy` is not implemented yet (no such target exists). Never treat
+    make
 
-a placeholder target's exit code 0 as successful verification.
+Tests (builds and runs the smoke tests):
 
-Build:
-
-    make
-
-Tests:
-
-    make test
+    make test
 
 Warnings:
 
-    build must be clean under -Wall -Wextra -Werror
+    build must be clean under -Wall -Wextra -Werror
 
-Sanitizers:
+Sanitizers (separate build/asan/ tree; runs tests under ASan/UBSan):
 
-    make asan
+    make asan
 
-Valgrind:
+Valgrind (runs the plain smoke test under Valgrind; errors fail):
 
-    make memcheck
+    make memcheck
 
-Deploy:
+Clean (removes build artifacts):
 
-    make deploy PI=<pi-host>
+    make clean
 
-Short soak:
+Unavailable targets (exit nonzero with a NOT AVAILABLE message; never
 
-    make soakcheck
+treat them as verification):
+
+    make run
+
+    make soakcheck
+
+Deploy is not implemented (no such target exists; planned only):
+
+    make deploy PI=<pi-host>
 
 A change is DONE only when the applicable build/tests pass and the
 

@@ -4,7 +4,7 @@ OpenChair is a handheld Raspberry Pi-based diagnostic reader for powered wheelch
 
 The software will decode supported, verified controller-specific patterns and show an understandable explanation. Unknown or unreliable readings must not produce an invented diagnosis; the device will instead offer retry or manual code entry. The product is designed to operate fully offline.
 
-> **Status: early development.** No application code, sensor support, or test suite exists yet. The repository currently contains project documentation and a placeholder Makefile only.
+> **Status: early development.** No sensor support, diagnostic logic, or real application exists yet. The repository contains project documentation, a working native Linux/WSL2 C23 build and test system, and a minimal scaffold CLI with smoke tests that exist only to exercise that toolchain.
 
 ## Target hardware
 
@@ -20,16 +20,16 @@ The software will decode supported, verified controller-specific patterns and sh
 
 ## Operating system and development environment
 
-- **Deployment target:** Raspberry Pi OS / Linux. The exact OS release has not been finalized or verified on hardware.
+- **Deployment target:** Raspberry Pi OS Lite 64-bit is the preferred deployment system, pending actual hardware verification. It has not been finalized or tested on hardware.
 - **Current development environment:** WSL2 Ubuntu with GCC 15.2.0 and GNU Make 4.4.1.
-- **Language and flags:** the systems core is written in C23 and compiled with `-Wall -Wextra -Werror`.
+- **Language and flags:** the systems core is written in C23 and compiled with `-std=c23 -Wall -Wextra -Werror -pedantic`.
 - **Simulation:** software-first development will use simulated sensor inputs until hardware is available. Simulation does not constitute live-hardware verification.
 
 ## Milestone status
 
 | Milestone | Status |
 |-----------|--------|
-| M0 | Repository skeleton exists; setup audit is underway. |
+| M0 | Repository setup verification is complete, subject to closing the remaining documentation and collaboration items. |
 | M1 | Project/problem memo received professor approval (5/5). The local memo has since been updated to reflect the current design. |
 | M2 | Detailed design and live hardware verification remain to be completed or verified. |
 
@@ -42,13 +42,17 @@ Mechanisms E (multiprocess fault isolation) and D (custom crash-consistent stora
 ├── CLAUDE.md             # team and development rules
 ├── PROBLEM.md            # problem memo
 ├── DESIGN.md             # design document (currently empty)
-├── Makefile              # placeholder targets (see below)
+├── Makefile              # native Linux/WSL2 build and test targets (see below)
 ├── README.md
 ├── .gitignore
 ├── src/                  # C23 systems implementation
+│   ├── main.c            # scaffold CLI (--version, --help); not the application
+│   └── version.c         # scaffold version string
 ├── include/              # public/shared C headers
+│   └── openchair_version.h
 ├── tests/                # automated tests
-│   └── fixtures/         # simulated/replayed sensor data
+│   ├── test_smoke.c      # smoke test of the scaffold CLI
+│   └── fixtures/         # simulated/replayed sensor data (empty)
 ├── YL626/
 │   ├── PROMPTLOG.md
 │   └── REFLECTION.md
@@ -59,14 +63,18 @@ Mechanisms E (multiprocess fault isolation) and D (custom crash-consistent stora
 
 ## Build and test
 
-There is currently nothing to build, run, deploy, or test. The software cannot yet read sensors or display diagnoses.
-
-Current `Makefile` targets:
+The build is native to Linux/WSL2 (GCC, GNU Make). There is no cross-compilation or Raspberry Pi deployment yet. The only program is a scaffold CLI (`openchair --version` / `--help`) whose purpose is to give the toolchain something real to build and test. It reads no sensors and produces no diagnoses.
 
 | Target | Behavior |
 |--------|----------|
-| `make`, `make test`, `make asan`, `make memcheck`, `make run`, `make soakcheck` | Placeholders that only print a "not implemented" message. An exit code of 0 is **not** evidence of a successful build or test. |
-| `make clean` | Implemented; removes `build/`. |
+| `make` / `make all` | Builds `build/plain/openchair`. |
+| `make test` | Builds and runs the smoke test (`build/plain/`). It runs the real `openchair` binary and checks its output and exit status. A failing check makes `make test` exit nonzero. |
+| `make asan` | Rebuilds in a separate tree (`build/asan/`) with AddressSanitizer + UBSan (UBSan findings are fatal) and runs the same smoke test. |
+| `make memcheck` | Runs the plain (non-sanitized) smoke test and its `openchair` children under Valgrind, failing on any error or definite/possible leak. Logs go to `build/valgrind-*.log`. Requires `valgrind` to be installed. |
+| `make clean` | Removes `build/`. |
+| `make run`, `make soakcheck` | **Not available.** Print a message and exit nonzero; no application or soak test exists. |
 | `make deploy` | Does not exist. |
 
-No production application or automated test suite has been implemented yet. Build, test, and deployment instructions will be added once they exist.
+Plain and sanitizer builds use separate object trees and are never mixed; Valgrind runs only on the plain build because it is incompatible with ASan.
+
+Verified on WSL2 Ubuntu (GCC 15.2.0, Make 4.4.1, Valgrind 3.26.0): `make test`, `make asan`, and `make memcheck` pass. This is software-only verification. Nothing here has been verified on a Raspberry Pi or with live hardware.
