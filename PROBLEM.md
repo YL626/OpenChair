@@ -1,4 +1,4 @@
-# Problem memo -- <OpenChair> (<Kacper Mazur>, <Alan De Lira>)
+# Problem memo -- OpenChair (Kacper Mazur, Alan De Lira)
 
 ## The user
 Powered (motorized) wheelchair users who experience controller faults, particularly those whose controllers report faults through diagnostic LED blink patterns, along with the caregivers and technicians who help them.

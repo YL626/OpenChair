@@ -20,7 +20,7 @@ The software will decode supported, verified controller-specific patterns and sh
 
 ## Operating system and development environment
 
-- **Deployment target:** Raspberry Pi OS / Linux. The exact OS release has not been finalized or verified on hardware.
+- **Deployment target:** Raspberry Pi OS Lite 64-bit is the preferred deployment system, pending actual hardware verification. It has not been finalized or tested on hardware.
 - **Current development environment:** WSL2 Ubuntu with GCC 15.2.0 and GNU Make 4.4.1.
 - **Language and flags:** the systems core is written in C23 and compiled with `-std=c23 -Wall -Wextra -Werror -pedantic`.
 - **Simulation:** software-first development will use simulated sensor inputs until hardware is available. Simulation does not constitute live-hardware verification.
@@ -29,7 +29,7 @@ The software will decode supported, verified controller-specific patterns and sh
 
 | Milestone | Status |
 |-----------|--------|
-| M0 | Repository skeleton exists; setup audit is underway. |
+| M0 | Repository setup verification is complete, subject to closing the remaining documentation and collaboration items. |
 | M1 | Project/problem memo received professor approval (5/5). The local memo has since been updated to reflect the current design. |
 | M2 | Detailed design and live hardware verification remain to be completed or verified. |
 
