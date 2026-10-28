@@ -17,6 +17,7 @@ All test input is synthetic and generated deterministically by `tests/test_util.
 | 3 | Detect corrupted record payloads | `tests/test_store.c` | `test_corrupt_payload_marker` (payload found by content), `test_corrupt_every_byte_of_record` (one bit flipped at every byte of a record: frame header, provenance, payload, CRC), `test_corrupt_first_and_last_record` |
 | 4 | Recover the valid prefix without fabricating records | `tests/test_store.c` | `test_prefix_trailing_garbage` (random and zero-filled tails), `test_prefix_replayed_frame` (byte-exact valid frames with repeated seqs), `test_prefix_missing_middle_record` (valid frames after a seq gap in the newest segment), `test_prefix_append_after_recovery` |
 | 5 | Recovery across multiple segments | `tests/test_store.c` | `test_multiseg_roundtrip` (≥3 segments, contiguous seq), `test_multiseg_torn_newest`, `test_multiseg_damaged_sealed` (older segment kept byte-identical and marked damaged), `test_multiseg_bad_newest_header` (newest segment removed), `test_multiseg_missing_middle` (gap reported, nothing invented) |
+| 6 | Invalid inputs | `tests/test_store.c` | `test_invalid_open` (bad cfg → `-EINVAL` with nothing created; missing dir → `-ENOENT`; file as dir → `-ENOTDIR`), `test_invalid_append` (every bad argument → `-EINVAL`, no seq consumed, state unchanged; empty and maximum payloads accepted), `test_invalid_other_calls` (NULL handles, bad stream, NULL visitor, read past end, visitor stop value propagated) |
 
 **Layout facts the corruption tests assume:**
 

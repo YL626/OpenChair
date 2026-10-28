@@ -899,6 +899,223 @@ out:
     tu_rmrf(ms.dir);
 }
 
+/* ===== 6. invalid inputs ===== */
+
+/* Number of entries in a directory (excluding . and ..), or -1. */
+static int dir_entries(const char *path)
+{
+    DIR *d = opendir(path);
+    if (d == NULL)
+        return -1;
+    int n = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strcmp(e->d_name, ".") != 0 && strcmp(e->d_name, "..") != 0)
+            n++;
+    }
+    closedir(d);
+    return n;
+}
+
+/* Opens with cfg, expecting `want`; a failed open leaves *out NULL and
+ * creates nothing in the store directory. */
+static void expect_open_fails(const struct oc_store_cfg *cfg, int want,
+                              const char *dir, const char *what)
+{
+    struct oc_store *st = (struct oc_store *)&st;   /* non-NULL sentinel */
+    int rc = oc_store_open(cfg, &st, NULL);
+    CHECK(rc == want);
+    CHECK(st == NULL);
+    if (rc == 0)
+        (void)oc_store_close(st);
+    if (dir != NULL)
+        CHECK(dir_entries(dir) == 0);
+    if (rc != want)
+        fprintf(stderr, "  (case: %s: got %d, want %d)\n", what, rc, want);
+}
+
+static void test_invalid_open(void)
+{
+    char dir[PATH_MAX] = "";
+    char path[PATH_MAX];
+    struct oc_store *st = NULL;
+
+    REQUIRE(tu_mkdtemp(dir, sizeof dir) == 0);
+    struct oc_store_cfg good = tu_cfg(dir);
+    struct oc_store_cfg cfg;
+
+    CHECK(oc_store_open(NULL, &st, NULL) == -EINVAL);
+    CHECK(st == NULL);
+    CHECK(oc_store_open(&good, NULL, NULL) == -EINVAL);
+    CHECK(dir_entries(dir) == 0);
+
+    cfg = good;
+    cfg.dir = NULL;
+    expect_open_fails(&cfg, -EINVAL, NULL, "dir NULL");
+    cfg.dir = "";
+    expect_open_fails(&cfg, -EINVAL, NULL, "dir empty");
+
+    /* Too small to hold one maximum-size record. */
+    cfg = good;
+    cfg.stream[OC_STREAM_TRACE].segment_bytes = OC_STORE_MAX_PAYLOAD;
+    expect_open_fails(&cfg, -EINVAL, dir, "segment_bytes == max payload");
+    cfg.stream[OC_STREAM_TRACE].segment_bytes = 0;
+    expect_open_fails(&cfg, -EINVAL, dir, "segment_bytes 0");
+    cfg = good;
+    cfg.stream[OC_STREAM_EVIDENCE].max_segments = 0;
+    expect_open_fails(&cfg, -EINVAL, dir, "max_segments 0");
+    cfg = good;
+    cfg.batch_records = 0;
+    expect_open_fails(&cfg, -EINVAL, dir, "batch_records 0");
+    cfg = good;
+    cfg.batch_ms = 0;
+    expect_open_fails(&cfg, -EINVAL, dir, "batch_ms 0");
+
+    /* OS errors are passed through as negative errno. */
+    REQUIRE(tu_path(path, sizeof path, dir, "missing") == 0);
+    cfg = good;
+    cfg.dir = path;
+    expect_open_fails(&cfg, -ENOENT, NULL, "dir missing");
+    CHECK(tu_file_size(path) < 0);   /* not created behind our back */
+
+    REQUIRE(tu_path(path, sizeof path, dir, "plain-file") == 0);
+    REQUIRE(tu_write_file(path, "x", 1, 0) == 0);
+    cfg.dir = path;
+    expect_open_fails(&cfg, -ENOTDIR, NULL, "dir is a regular file");
+out:
+    tu_rmrf(dir);
+}
+
+/* Every invalid append returns -EINVAL, leaves *seq_out alone, consumes no
+ * seq, and leaves the store OK with nothing buffered. */
+static void test_invalid_append(void)
+{
+    char dir[PATH_MAX] = "";
+    struct oc_store *st = NULL;
+    unsigned char *big = NULL;
+    static const unsigned char body[8] = "payload";
+    const struct oc_prov good = tu_prov(1);
+    struct oc_prov prov;
+    uint64_t seq;
+
+    REQUIRE(tu_mkdtemp(dir, sizeof dir) == 0);
+    struct oc_store_cfg cfg = tu_cfg(dir);
+    REQUIRE(oc_store_open(&cfg, &st, NULL) == 0);
+    big = calloc(1, OC_STORE_MAX_PAYLOAD + 1);
+    REQUIRE(big != NULL);
+
+#define BAD_APPEND(st_, stream_, type_, prov_, data_, len_, flags_)                 \
+    do {                                                                            \
+        seq = 777;                                                                  \
+        CHECK(oc_store_append(st_, stream_, type_, prov_, data_, len_, flags_, &seq) \
+              == -EINVAL);                                                          \
+        CHECK(seq == 777);                                                          \
+    } while (0)
+
+    BAD_APPEND(NULL, OC_STREAM_EVIDENCE, OC_REC_EVENT, &good, body, sizeof body, 0);
+    BAD_APPEND(st, OC_STREAM_COUNT, OC_REC_EVENT, &good, body, sizeof body, 0);
+    BAD_APPEND(st, (enum oc_stream)-1, OC_REC_EVENT, &good, body, sizeof body, 0);
+    BAD_APPEND(st, OC_STREAM_EVIDENCE, (enum oc_rec_type)0, &good, body, sizeof body, 0);
+    BAD_APPEND(st, OC_STREAM_EVIDENCE, (enum oc_rec_type)5, &good, body, sizeof body, 0);
+    BAD_APPEND(st, OC_STREAM_EVIDENCE, OC_REC_EVENT, NULL, body, sizeof body, 0);
+    BAD_APPEND(st, OC_STREAM_EVIDENCE, OC_REC_EVENT, &good, NULL, 5, 0);
+    BAD_APPEND(st, OC_STREAM_EVIDENCE, OC_REC_EVENT, &good, big, OC_STORE_MAX_PAYLOAD + 1, 0);
+    BAD_APPEND(st, OC_STREAM_EVIDENCE, OC_REC_EVENT, &good, body, sizeof body, 0x80u);
+
+    prov = good;
+    prov.kind = 0;
+    BAD_APPEND(st, OC_STREAM_EVIDENCE, OC_REC_EVENT, &prov, body, sizeof body, 0);
+    prov.kind = OC_KIND_SYSTEM + 1;
+    BAD_APPEND(st, OC_STREAM_EVIDENCE, OC_REC_EVENT, &prov, body, sizeof body, 0);
+    prov = good;
+    prov.origin = 0;
+    BAD_APPEND(st, OC_STREAM_EVIDENCE, OC_REC_EVENT, &prov, body, sizeof body, 0);
+    prov.origin = OC_ORIGIN_NONE + 1;
+    BAD_APPEND(st, OC_STREAM_EVIDENCE, OC_REC_EVENT, &prov, body, sizeof body, 0);
+    prov = good;
+    prov.flags = 0x80u;
+    BAD_APPEND(st, OC_STREAM_EVIDENCE, OC_REC_EVENT, &prov, body, sizeof body, 0);
+#undef BAD_APPEND
+
+    struct oc_store_status ss;
+    REQUIRE(oc_store_status(st, &ss) == 0);
+    CHECK(ss.state == OC_STORE_OK);
+    CHECK(ss.last_errno == 0);
+    for (int s = 0; s < OC_STREAM_COUNT; s++)
+        CHECK(ss.stream[s].buffered == 0 && ss.stream[s].durable == 0);
+
+    /* The edges that are valid: an empty payload (NULL allowed), and exactly
+     * the maximum. No seq was consumed by the rejected calls. */
+    CHECK(oc_store_append(st, OC_STREAM_EVIDENCE, OC_REC_EVENT, &good, NULL, 0, 0, &seq) == 0);
+    CHECK(seq == 0);
+    CHECK(oc_store_append(st, OC_STREAM_EVIDENCE, OC_REC_EVENT, &good, big,
+                          OC_STORE_MAX_PAYLOAD, 0, NULL) == 0);
+    CHECK(oc_store_sync(st, OC_STREAM_EVIDENCE, &seq) == 0);
+    CHECK(seq == 1);
+out:
+    free(big);
+    CHECK(oc_store_close(st) == 0);
+    tu_rmrf(dir);
+}
+
+/* A visitor that stops after `limit` records by returning `stop`. */
+struct stop_ctx {
+    int seen, limit, stop;
+};
+
+static int stop_visit(const struct oc_record_view *r, void *ctx)
+{
+    (void)r;
+    struct stop_ctx *s = ctx;
+    return ++s->seen == s->limit ? s->stop : 0;
+}
+
+static void test_invalid_other_calls(void)
+{
+    char dir[PATH_MAX] = "";
+    struct oc_store *st = NULL;
+    struct oc_store_status ss;
+    uint64_t seq;
+
+    /* NULL handles. close(NULL) is a no-op, like free(NULL). */
+    CHECK(oc_store_tick(NULL, 0) == -EINVAL);
+    CHECK(oc_store_sync(NULL, OC_STREAM_EVIDENCE, &seq) == -EINVAL);
+    CHECK(oc_store_status(NULL, &ss) == -EINVAL);
+    CHECK(oc_store_read(NULL, OC_STREAM_EVIDENCE, 0, stop_visit, NULL) == -EINVAL);
+    CHECK(oc_store_close(NULL) == 0);
+
+    REQUIRE(tu_mkdtemp(dir, sizeof dir) == 0);
+    struct oc_store_cfg cfg = tu_cfg(dir);
+    REQUIRE(oc_store_open(&cfg, &st, NULL) == 0);
+    REQUIRE(tu_append_n(st, OC_STREAM_TRACE, 0, 10, tu_len_marked, OC_STORE_FORCE_SYNC) == 0);
+
+    CHECK(oc_store_status(st, NULL) == -EINVAL);
+    CHECK(oc_store_sync(st, OC_STREAM_COUNT, &seq) == -EINVAL);
+    CHECK(oc_store_read(st, OC_STREAM_COUNT, 0, stop_visit, NULL) == -EINVAL);
+    CHECK(oc_store_read(st, OC_STREAM_TRACE, 0, NULL, NULL) == -EINVAL);
+
+    /* Reading past the end visits nothing and succeeds. */
+    struct stop_ctx sc = {.limit = 1, .stop = 1};
+    CHECK(oc_store_read(st, OC_STREAM_TRACE, 10, stop_visit, &sc) == 0);
+    CHECK(sc.seen == 0);
+
+    /* A visitor's nonzero return stops the read and is propagated. */
+    sc = (struct stop_ctx){.limit = 3, .stop = 42};
+    CHECK(oc_store_read(st, OC_STREAM_TRACE, 0, stop_visit, &sc) == 42);
+    CHECK(sc.seen == 3);
+    sc = (struct stop_ctx){.limit = 2, .stop = -7};
+    CHECK(oc_store_read(st, OC_STREAM_TRACE, 0, stop_visit, &sc) == -7);
+    CHECK(sc.seen == 2);
+
+    /* None of the above changed the store. */
+    REQUIRE(oc_store_status(st, &ss) == 0);
+    CHECK(ss.state == OC_STORE_OK);
+    CHECK(ss.stream[OC_STREAM_TRACE].durable == 10);
+out:
+    CHECK(oc_store_close(st) == 0);
+    tu_rmrf(dir);
+}
+
 int main(void)
 {
     RUN(test_crc32_known_answers);
@@ -925,5 +1142,9 @@ int main(void)
     RUN(test_multiseg_damaged_sealed);
     RUN(test_multiseg_bad_newest_header);
     RUN(test_multiseg_missing_middle);
+
+    RUN(test_invalid_open);
+    RUN(test_invalid_append);
+    RUN(test_invalid_other_calls);
     return tu_finish("test_store");
 }
