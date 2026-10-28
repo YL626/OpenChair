@@ -39,15 +39,12 @@ Selected, annotated Claude Code episodes. Prompts are quoted verbatim. Claude's 
 
 **My answers to Claude's questions:**
 
-- *Contract:* "Ok, things have been merged and now we are up to date. Before we continue, could you quickly go over what's been added, explained like I'm 15?"
+- *Contract:* "Ok, things have been merged and now we are up to date.
 - *Red tests:* separate red target (`make test-store`), keeping `make test` green.
 - *My thoughts:* placeholder for me.
 
-**Note:** Claude ended that turn with "No response requested." It did not give the ELI15 explanation I'd asked for until the next turn, when it wrote it into the PDF.
-
-### My thoughts
-
-> _To be written by Kacper._ Possible prompts: Did "split by harness, not by test case" match your instinct? Was it right to stop and ask about the empty DESIGN.md instead of guessing the contract? What did you think of the missed ELI15 answer?
+### My thoughts:
+I had originally asked the question of "should each test go into a seperate file, or should all tests collect into one single test file?" Because one seems like too much abstraction and the other seems like too little. As all things are, the answer was found in the middle, where it depends on the harness. This made sense, where you would abstract as many times are there were big ideas. instead of hitting tab after every sentence vs every page, you instead tab at every paragraph. It also pointed out that I was a couple of commits behind which I quickly reviewed, summarized, and updated before I asked it to continue. I also might have asked it to create me a "explain like I'm 15" summary, somewhat embarrasingly. But hey. Understanding what you're building is a requirement.
 
 ---
 
@@ -71,8 +68,7 @@ Selected, annotated Claude Code episodes. Prompts are quoted verbatim. Claude's 
   - commit 8 adds the kill binary and this PROMPTLOG.
 
 ### My thoughts
-
-> _To be written by Kacper._ Possible prompts: Did the ELI15 analogies actually help with the data states (buffered/written/durable/uncertain)? Is one commit/PR per test case worth the overhead?
+The ELI15 did help a lot, as I find that analogies is what sticks in my head the most. The jargon overload sometimes gets annoying. Is the 1 commit every time a test gets written worth the overhead? Absolutely. Coming from CS314, a class where you would practically commit and PR every time you typed out a character, one commit every test seems a very minimal amount of overhead to deal with. I also do think that it makes the reviewer stop and actually look at what is being tested, in a bite-size chunk.
 
 ---
 
@@ -97,9 +93,8 @@ Selected, annotated Claude Code episodes. Prompts are quoted verbatim. Claude's 
 - **Commit 2, `e72e19d`:** truncation at every byte offset across the last two records and across the header/first record. The first build failed `-Werror` with `format-truncation` on a `snprintf` into a `NAME_MAX` buffer. Claude replaced it with an explicit length check rather than suppressing the warning.
 - Each time I switched branches, Claude checked `git status` and confirmed its uncommitted work had carried over before continuing.
 
-### My thoughts
-
-> _To be written by Kacper._
+### My thoughts:
+Some of these tests seem fairly obvious, like yes obviously when you make a fresh open, you should recieve an empty report!?!? When I did think about what could happen in the real world, however, I realized that what we couldn't let happen is call for a fresh open and recieve some records that were from a past session. Another test was a sweep where the last two records as well as the segment header are cut before being checked and discarded if actually truncated. I am familiar with sweeps, or an intentional and targeted failure, from our red-black tree assignment.
 
 ---
 
@@ -119,9 +114,8 @@ It then noticed the branch with the open PR was still checked out, created `kacp
 
 **Commit 3, `a06764c`:** single-bit flips in the payload marker, at every byte of a middle record (frame header, provenance, payload, CRC), and in the first and last records.
 
-### My thoughts
-
-> _To be written by Kacper._
+### My thoughts:
+I suspect that my memory is being unseated or is just corrupted in some way in my laptop because I got a few issues with random kernel panics. I dropped $170 on new laptop memory hoping to fix it, only for me to unslot and reslot in the old memory and it seems to be working somewhat so far. Only crashed once afterwards. This was where it crashed. I'm keeping the new memory close. Anyways, This test was another sweep where a bit in the header and body are flipped. If it only returns all before the flip, it passes, as a general test to see the report work.
 
 ---
 
@@ -147,9 +141,8 @@ It then noticed the branch with the open PR was still checked out, created `kacp
   - a deleted middle segment, so a gap is reported.
 - For the mix-up: before committing anything, Claude confirmed that the staged changes on `kacperm37-tests5` were **byte-identical** to its earlier commit `b724fa0` (it compared the diffs with `cmp`). It then re-ran the checks and committed them as `a1239c1` on the new branch.
 
-### My thoughts
-
-> _To be written by Kacper._
+### My thoughts:
+I lost track of what I was doing and accidentally put two tests on one commit. I might do that intentionally later to save Alan some amount of commits to go through, but for now I got to learn about soft resetting.
 
 ---
 
@@ -167,8 +160,7 @@ It then noticed the branch with the open PR was still checked out, created `kacp
 - **Valgrind caught a real bug in the test:** the EFBIG test's cleanup path restored a `struct sigaction` that was never saved when `open` failed early. Claude fixed it with a `sa_saved` flag and re-ran: 0 Valgrind errors.
 
 ### My thoughts
-
-> _To be written by Kacper._ Possible prompts: The sanitizer and Valgrind targets caught a bug in *test* code before any implementation existed. What does that say about running them on every commit?
+I think this is a good example as to why branching + committing between every test proves beneficial. If the sanitizer and Valgrind targets catch a bug in commit 5 and not 4 or below, it's clearly an issue that came up when building commit 5. If all of this was under one commit, every single test would be under challenge. Now, only one is.
 
 ---
 
@@ -195,8 +187,7 @@ It then noticed the branch with the open PR was still checked out, created `kacp
 - Noted that the fork/ack/kill harness itself can't run against the stub, because the child exits at `open`. Its first real exercise comes with the implementation.
 
 ### My thoughts
-
-> _To be written by Kacper._ Possible prompts: Do you agree with the "does not prove" list? Which experiment would close the power-loss gap?
+I do agree with the "does not prove list". As it stands I think those are edge cases and the issues will be settled as soon as the working code comes into play (not just tests) and when we probably build a fuzzer (like in the red-black tree project) to make sure it can survive the required 48 hour soak.
 
 ---
 
