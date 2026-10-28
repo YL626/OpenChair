@@ -21,19 +21,34 @@ Every IPC message has a 4-byte envelope: version u8, type u8, payload length u16
 
 The receiver rejects and counts unknown enum values, a nonzero reserved byte, a wrong length, and an unsupported version (closing the connection on the last).
 
+**Control messages (S3A, `include/oc_ipc_msg.h`).** Same envelope (version 1, type, payload length u16 LE) and the same explicit little-endian encoding. Each type has exactly one legal payload length and a datagram must be exactly `4 + payload_len` bytes. Every reserved byte must be 0. The largest defined datagram is 28 B (SAMPLE).
+
+| Type | Payload | Layout (offset: field) |
+|---|---|---|
+| HELLO (1) | 20 B | 0: `source` u8 (1 LIGHT, 2 DISTANCE); 1: `origin` u8 (1 LIVE, 2 SIMULATED, 3 REPLAYED); 2-3: reserved; 4: `session_id` u64 (nonzero); 12: `instance` u32; 16: `pid` u32 (declared) |
+| HELLO_ACK (2) | 16 B | 0: `session_id` u64 (echo); 8: `instance` u32 (echo); 12: `source` u8 (echo); 13-15: reserved |
+| HELLO_REJECT (3) | 8 B | 0: `reason` u16; 2-3: reserved; 4: `detail` u32 (0 for now) |
+| BYE (5) | 4 B | 0: `reason` u16 (1 NORMAL, 2 SHUTDOWN, 3 ERROR); 2-3: reserved |
+
+REJECT reasons: 1 MALFORMED, 2 BAD_SOURCE, 3 BAD_ORIGIN, 4 SESSION_MISMATCH, 5 PEER_CRED, 6 DUPLICATE_SOURCE, 7 STALE_INSTANCE, 8 NOT_READY. Values 6 and 7 are defined on the wire but need hub state, so they are first produced by the S3B hub, not by the stateless check. The existing `oc_msg_header_decode` still accepts any length for these types; the exact lengths are enforced by `oc_ipc_msg_decode`, which is what the transport uses.
+
+**Receive errors.** A datagram of the wrong length (`-EMSGSIZE`), unknown type, wrong payload length for its type, nonzero reserved byte or illegal enum (`-EBADMSG`) is consumed whole and counted; the connection stays synchronized and usable. An unsupported version (`-EPROTONOSUPPORT`, checked first and for any size) is connection-fatal: the receiver closes without a reply.
+
 ## 2. Session and instance handling
 
 - The supervisor draws a random 64-bit `session_id` with `getrandom` at startup and gives each spawned child an `instance` number from a per-session counter, passed on the command line.
-- The child sends both in HELLO, with its role, protocol version, and input mode (LIVE, SIMULATED or REPLAYED). The hub rejects any sample whose `origin` differs from the declared mode.
+- The child sends both in HELLO, with its source, input mode (`origin`: LIVE, SIMULATED or REPLAYED) and its own pid; the protocol version is in the envelope. The hub rejects any sample whose `origin` differs from the declared mode (checked per connection in S3B).
+- The stateless HELLO check (`oc_ipc_hello_check`) compares, in this order: peer uid and, when enabled, the declared pid against `SO_PEERCRED` (PEER_CRED); `session_id` (SESSION_MISMATCH); the source is known and permitted (BAD_SOURCE); the origin equals the one expected for that source (BAD_ORIGIN). The expected origin is configured **per source**, so a development session may mix origins (for example LIVE light with SIMULATED distance). A mixed-origin session cannot count as M3's two-LIVE-sensor evidence. `SO_PEERCRED` shows which local process connected; it does not show that the data is a genuine sensor measurement.
+- `session_id` 0 is reserved and rejected. `instance` 0 is a legal value (the per-session counter may start at 0). Whether an instance is stale, a duplicate or a restart is decided by the hub from its per-source state (S3B).
 - A sample is identified by `(session_id, source, instance, seq)`.
 - A new `instance` for a source means the reader restarted. The hub resets that source's filter and baseline state, abandons any in-progress capture, and records the discontinuity.
 - A `seq` gap within one instance means loss, including samples dropped while the hub was away. The hub counts the gap and rejects a capture that spans it.
 
 ## 3. IPC connection lifecycle
 
-1. The hub creates a runtime directory (mode 0700) and a `SOCK_SEQPACKET|SOCK_CLOEXEC` listening socket in it, removing any stale socket path first. The supervisor runs one hub at a time.
-2. A reader connects and sends HELLO. The hub checks `SO_PEERCRED`, version, role, mode and instance, then replies HELLO_ACK or HELLO_REJECT with a reason code.
-3. The reader sends SAMPLE messages with `MSG_DONTWAIT|MSG_NOSIGNAL`. If the socket is full or disconnected, it drops the sample, increments a counter, and keeps its I2C loop on schedule. It never buffers without bound.
+1. The hub's runtime directory (mode 0700, created by the caller) must be owned by the effective uid with no group/other write bit. `oc_ipc_server_open` creates a `SOCK_SEQPACKET|SOCK_CLOEXEC|SOCK_NONBLOCK` listening socket there (chmod 0600) and records the socket file's device and inode. An existing path is only replaced if it is a socket owned by us with no listener (a connect probe returns `ECONNREFUSED`); a live server gives `-EADDRINUSE`; any other file type, including a symlink, is refused and never unlinked. On close the path is unlinked only if it is still that same socket file. The supervisor runs one hub at a time.
+2. A reader connects (nonblocking; a full backlog gives `-EAGAIN`, an in-progress connect is completed with `poll` and `getsockopt(SO_ERROR)`, and the peer's uid must be ours) and sends HELLO. The hub checks the version, framing, `SO_PEERCRED`, session, source, origin and instance, then replies HELLO_ACK or HELLO_REJECT with a reason code. The reader's `oc_ipc_client_handshake` applies one `CLOCK_MONOTONIC` deadline to completing the connect, sending HELLO and receiving the reply, succeeds only for a HELLO_ACK that echoes its `session_id`, `instance` and `source`, reports a REJECT with its reason, and closes the connection on any failure.
+3. The reader sends SAMPLE messages with `MSG_DONTWAIT|MSG_NOSIGNAL`. If the socket is full or disconnected, it drops the sample, increments `tx_dropped` exactly once, and keeps its I2C loop on schedule. There is no userspace queue. The bound on unread data is the sender's `SO_SNDBUF` (requested 16 KiB, so 32 KiB effective [MEASURE]): the kernel refuses a send once it is full, so at most `SO_SNDBUF / 28 + 1` samples are ever queued (the real count is far lower because of per-datagram kernel overhead); the library does not rely on `net.unix.max_dgram_qlen` for the bound, though a smaller sysctl could lower the capacity further. Control messages are never dropped silently: a full buffer returns `-EAGAIN` to the caller. On the development kernel (Linux 6.18, WSL2) 43 samples were accepted before `-EAGAIN`.
 4. On EOF or `ECONNRESET` the reader reconnects with backoff (100 ms doubling to 2 s) and sends a new HELLO with the same instance. `seq` keeps counting, so the gap is visible to the hub.
 5. When a reader exits or its connection closes, the hub marks that source disconnected and the system degraded. The supervisor restarts the reader with a new instance; the new connection resets the source (section 2).
 6. When the hub restarts, readers see EOF and follow step 4.

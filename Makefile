@@ -35,18 +35,24 @@ ASAN_ENV := ASAN_OPTIONS=detect_leaks=1:abort_on_error=0 \
 
 all: $(PLAIN)/openchair
 
-test: $(PLAIN)/test_smoke $(PLAIN)/test_sample $(PLAIN)/test_light $(PLAIN)/test_i2c_linux $(PLAIN)/openchair
+test: $(PLAIN)/test_smoke $(PLAIN)/test_sample $(PLAIN)/test_light $(PLAIN)/test_i2c_linux \
+		$(PLAIN)/test_ipc_msg $(PLAIN)/test_ipc $(PLAIN)/openchair
 	./$(PLAIN)/test_smoke
 	./$(PLAIN)/test_sample
 	./$(PLAIN)/test_light
 	./$(PLAIN)/test_i2c_linux
+	./$(PLAIN)/test_ipc_msg
+	./$(PLAIN)/test_ipc
 
-asan: $(ASAN)/test_smoke $(ASAN)/test_sample $(ASAN)/test_light $(ASAN)/test_i2c_linux $(ASAN)/openchair
+asan: $(ASAN)/test_smoke $(ASAN)/test_sample $(ASAN)/test_light $(ASAN)/test_i2c_linux \
+		$(ASAN)/test_ipc_msg $(ASAN)/test_ipc $(ASAN)/openchair
 	ASAN_OPTIONS=detect_leaks=1:abort_on_error=0 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
 		./$(ASAN)/test_smoke
 	$(ASAN_ENV) ./$(ASAN)/test_sample
 	$(ASAN_ENV) ./$(ASAN)/test_light
 	$(ASAN_ENV) ./$(ASAN)/test_i2c_linux
+	$(ASAN_ENV) ./$(ASAN)/test_ipc_msg
+	$(ASAN_ENV) ./$(ASAN)/test_ipc
 
 memcheck: $(PLAIN)/test_smoke $(PLAIN)/openchair
 	@command -v valgrind >/dev/null || { echo "memcheck: valgrind not installed" >&2; exit 1; }
@@ -99,6 +105,25 @@ asan-light: $(addprefix $(ASAN)/,$(LIGHT_TESTS))
 
 memcheck-light: $(addprefix $(PLAIN)/,$(LIGHT_TESTS))
 	@command -v valgrind >/dev/null || { echo "memcheck-light: valgrind not installed" >&2; exit 1; }
+	@rc=0; for t in $^; do valgrind -q --error-exitcode=99 --leak-check=full \
+		--errors-for-leak-kinds=definite,possible ./$$t || rc=1; done; exit $$rc
+
+# IPC tests: control-message codec (pure) and the AF_UNIX SOCK_SEQPACKET
+# transport over REAL sockets in a private tmp dir. Sensor data is SIMULATED;
+# no hardware. test_ipc wraps connect/send/recvmsg as fault-injection seams
+# (default mode: call the real function).
+.PHONY: test-ipc asan-ipc memcheck-ipc
+$(PLAIN)/test_ipc $(ASAN)/test_ipc: LDWRAP := -Wl,--wrap=connect,--wrap=send,--wrap=recvmsg
+IPC_TESTS := test_ipc_msg test_ipc
+
+test-ipc: $(addprefix $(PLAIN)/,$(IPC_TESTS))
+	@rc=0; for t in $^; do ./$$t || rc=1; done; exit $$rc
+
+asan-ipc: $(addprefix $(ASAN)/,$(IPC_TESTS))
+	@rc=0; for t in $^; do $(ASAN_ENV) ./$$t || rc=1; done; exit $$rc
+
+memcheck-ipc: $(addprefix $(PLAIN)/,$(IPC_TESTS))
+	@command -v valgrind >/dev/null || { echo "memcheck-ipc: valgrind not installed" >&2; exit 1; }
 	@rc=0; for t in $^; do valgrind -q --error-exitcode=99 --leak-check=full \
 		--errors-for-leak-kinds=definite,possible ./$$t || rc=1; done; exit $$rc
 
