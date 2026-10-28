@@ -19,6 +19,7 @@ All test input is synthetic and generated deterministically by `tests/test_util.
 | 5 | Recovery across multiple segments | `tests/test_store.c` | `test_multiseg_roundtrip` (≥3 segments, contiguous seq), `test_multiseg_torn_newest`, `test_multiseg_damaged_sealed` (older segment kept byte-identical and marked damaged), `test_multiseg_bad_newest_header` (newest segment removed), `test_multiseg_missing_middle` (gap reported, nothing invented) |
 | 6 | Invalid inputs | `tests/test_store.c` | `test_invalid_open` (bad cfg → `-EINVAL` with nothing created; missing dir → `-ENOENT`; file as dir → `-ENOTDIR`), `test_invalid_append` (every bad argument → `-EINVAL`, no seq consumed, state unchanged; empty and maximum payloads accepted), `test_invalid_other_calls` (NULL handles, bad stream, NULL visitor, read past end, visitor stop value propagated) |
 | 7 | Write failures | `tests/test_store_faults.c` | `test_fault_sync_eio_batched`, `test_fault_sync_eio_force_sync` (failed sync → FAILED, records uncertain, `durable_seq` not advanced, never success again on that handle, recovery keeps an intact prefix containing every acknowledged record), `test_fault_write_enospc`, `test_fault_short_write_and_eintr` (must be retried, data intact), `test_fault_dir_fsync` (at open and at segment rollover), `test_fault_real_efbig` and `test_fault_real_eacces` (real kernel errors, no mocking), `test_no_fd_leak`; every test also checks its descriptor count is unchanged |
+| 8 | Process-kill tests (and what they do and do not prove) | `tests/test_store_kill.c` | `test_kill_force_sync` (20 trials), `test_kill_batched` (10 trials), `test_kill_repeated_same_store` (8 crash/restart rounds on one store) |
 
 **Fault-injection seam (test 7).**
 
@@ -42,6 +43,21 @@ The tests are split by **what they need from the harness**, not one file per cas
 - `test_store.c` holds the functional tests, which link normally.
 - `test_store_faults.c` injects write/sync failures with `-Wl,--wrap=...`. That link flag applies to the whole binary, so this suite must be its own binary.
 - `test_store_kill.c` runs fork + `SIGKILL` crash trials. They're slow and timing-dependent, and they come with their own statement of what they prove.
+
+**Process-kill tests (test 8).**
+
+- *How they work:*
+  - A forked child writes records and reports each acknowledgement over a pipe: a FORCE_SYNC append that returned 0, or a `durable_seq` from `oc_store_sync`.
+  - The parent sends `SIGKILL` after a seeded-random number of acks (0–60) plus a 0–2 ms delay. The kill can therefore land in open/recovery, mid-batch, mid-sync or at a segment rollover; 80 KiB segments make rollovers frequent.
+  - The parent then reopens the store and checks that every acknowledged record is present and byte-exact, there are no corrupt or duplicate records, no segment is reported damaged, and recovery is idempotent.
+  - The seed is fixed (`0x0C5701E5`) and printed, so failures reproduce.
+- *They prove:* recovery is consistent when the writer process dies at an arbitrary point, and acknowledged records survive process death.
+- *They do not prove:*
+  - power-loss durability: `SIGKILL` ends the process, not the kernel, so every completed `write()` still reaches the file through the page cache, and these tests would pass even with no fsync at all;
+  - that the SD card or ext4 honour flush;
+  - torn or reordered sector writes (covered instead by the truncation and bit-flip tests);
+  - the DESIGN.md §6 target of ≥ 1,000 trials, which belongs to the evaluation.
+- *Before the implementation exists:* the fork/ack/kill harness can't be exercised against the stub, because the child exits at `open` before any kill. It will be exercised for the first time when the implementation lands.
 
 ## Proposed on-disk format [REVIEW]
 
