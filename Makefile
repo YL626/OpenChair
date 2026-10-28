@@ -35,14 +35,18 @@ ASAN_ENV := ASAN_OPTIONS=detect_leaks=1:abort_on_error=0 \
 
 all: $(PLAIN)/openchair
 
-test: $(PLAIN)/test_smoke $(PLAIN)/test_sample $(PLAIN)/openchair
+test: $(PLAIN)/test_smoke $(PLAIN)/test_sample $(PLAIN)/test_light $(PLAIN)/test_i2c_linux $(PLAIN)/openchair
 	./$(PLAIN)/test_smoke
 	./$(PLAIN)/test_sample
+	./$(PLAIN)/test_light
+	./$(PLAIN)/test_i2c_linux
 
-asan: $(ASAN)/test_smoke $(ASAN)/test_sample $(ASAN)/openchair
+asan: $(ASAN)/test_smoke $(ASAN)/test_sample $(ASAN)/test_light $(ASAN)/test_i2c_linux $(ASAN)/openchair
 	ASAN_OPTIONS=detect_leaks=1:abort_on_error=0 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
 		./$(ASAN)/test_smoke
 	$(ASAN_ENV) ./$(ASAN)/test_sample
+	$(ASAN_ENV) ./$(ASAN)/test_light
+	$(ASAN_ENV) ./$(ASAN)/test_i2c_linux
 
 memcheck: $(PLAIN)/test_smoke $(PLAIN)/openchair
 	@command -v valgrind >/dev/null || { echo "memcheck: valgrind not installed" >&2; exit 1; }
@@ -79,6 +83,24 @@ asan-sample: $(ASAN)/test_sample
 memcheck-sample: $(PLAIN)/test_sample
 	@command -v valgrind >/dev/null || { echo "memcheck-sample: valgrind not installed" >&2; exit 1; }
 	valgrind -q --error-exitcode=99 --leak-check=full --errors-for-leak-kinds=definite,possible ./$<
+
+# ADS1115 light reader tests (SIMULATED I2C only; no hardware. Sources use enum oc_origin from oc_store.h and
+# every test links all of src/, so oc_store must compile).
+# test_i2c_linux wraps ioctl to script I2C_FUNCS / I2C_RDWR.
+.PHONY: test-light asan-light memcheck-light
+$(PLAIN)/test_i2c_linux $(ASAN)/test_i2c_linux: LDWRAP := -Wl,--wrap=ioctl
+LIGHT_TESTS := test_light test_i2c_linux
+
+test-light: $(addprefix $(PLAIN)/,$(LIGHT_TESTS))
+	@rc=0; for t in $^; do ./$$t || rc=1; done; exit $$rc
+
+asan-light: $(addprefix $(ASAN)/,$(LIGHT_TESTS))
+	@rc=0; for t in $^; do $(ASAN_ENV) ./$$t || rc=1; done; exit $$rc
+
+memcheck-light: $(addprefix $(PLAIN)/,$(LIGHT_TESTS))
+	@command -v valgrind >/dev/null || { echo "memcheck-light: valgrind not installed" >&2; exit 1; }
+	@rc=0; for t in $^; do valgrind -q --error-exitcode=99 --leak-check=full \
+		--errors-for-leak-kinds=definite,possible ./$$t || rc=1; done; exit $$rc
 
 run:
 	@echo "NOT AVAILABLE: no application exists yet (only a scaffold CLI)." >&2; exit 1

@@ -12,12 +12,14 @@ Raw counts only; derived values are never sent. A sample is 24 bytes, little-end
 | 8 | 4 | `seq` | Per source and instance, from 0, +1 per sample attempt |
 | 12 | 1 | `source` | 1 LIGHT, 2 DISTANCE |
 | 13 | 1 | `origin` | 1 LIVE, 2 SIMULATED, 3 REPLAYED |
-| 14 | 1 | `status` | OK, SATURATED, NACK, TIMEOUT, RANGE_ERR, STALE |
+| 14 | 1 | `status` | 1 OK, 2 SATURATED, 3 NACK, 4 TIMEOUT, 5 RANGE_ERR, 6 STALE, 7 IO_ERR (**pending: awaiting Kacper's approval**) |
 | 15 | 1 | reserved | Must be 0 |
 | 16 | 4 | `value` | i32: signed ADC counts, or millimetres. 0 when `status` is not OK |
 | 20 | 4 | `aux` | u32: ADS1115 config word, or raw VL6180X status code **[MEASURE]** |
 
-Every IPC message has a 4-byte envelope: version u8, type u8, payload length u16. Types: HELLO, HELLO_ACK, HELLO_REJECT, SAMPLE, BYE. A SAMPLE message is 28 bytes. The receiver rejects and counts unknown enum values, a nonzero reserved byte, a wrong length, and an unsupported version (closing the connection on the last).
+Every IPC message has a 4-byte envelope: version u8, type u8, payload length u16. Types: HELLO, HELLO_ACK, HELLO_REJECT, SAMPLE, BYE. A SAMPLE message is 28 bytes. **Status 7, IO_ERR (S2, issue #14; shared change awaiting Kacper's approval).** A read failed for a reason that is neither a NACK nor a timeout (EIO, EBUSY, arbitration loss, config readback mismatch). Values 1-6 are unchanged. `OC_PROTO_VERSION` stays 1 during this development phase, so a decoder built without IO_ERR support rejects status 7 as malformed (`-EBADMSG`) and is incompatible with this sender; all builds must be updated together. A version bump is a team decision to revisit before any release or soak. As with every non-OK status, `value` must be 0.
+
+The receiver rejects and counts unknown enum values, a nonzero reserved byte, a wrong length, and an unsupported version (closing the connection on the last).
 
 ## 2. Session and instance handling
 

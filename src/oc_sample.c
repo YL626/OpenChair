@@ -58,7 +58,7 @@ static bool origin_ok(uint8_t v)
 
 static bool status_ok(uint8_t v)
 {
-    return v >= OC_ST_OK && v <= OC_ST_STALE;
+    return v >= OC_ST_OK && v <= OC_ST_IO_ERR;
 }
 
 static bool type_ok(uint8_t v)

@@ -54,7 +54,12 @@ enum oc_sample_status {
     OC_ST_NACK = 3,
     OC_ST_TIMEOUT = 4,
     OC_ST_RANGE_ERR = 5,
-    OC_ST_STALE = 6
+    OC_ST_STALE = 6,
+    /* PENDING SHARED-INTERFACE CHANGE (S2, issue #14): not yet reviewed by
+     * Kacper. A read failed for a reason that is neither a NACK nor a
+     * timeout (e.g. EIO, EBUSY, arbitration loss, config readback
+     * mismatch). Requires his review before this merges. */
+    OC_ST_IO_ERR = 7
 };
 
 enum oc_msg_type {
