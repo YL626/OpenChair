@@ -23,7 +23,7 @@ ASAN_LIB_OBJ := $(addprefix $(ASAN)/,$(LIB_NAMES))
 
 # oc_store tests. Written before the implementation: until src/oc_store.c is
 # real these targets are EXPECTED TO FAIL. They move into `make test` once green.
-STORE_TESTS := test_store test_store_faults
+STORE_TESTS := test_store test_store_faults test_store_kill
 # Fault-injection seam: the faults binary routes oc_store's write/sync calls
 # through __wrap_* functions in tests/test_store_faults.c.
 STORE_WRAP := -Wl,--wrap=write,--wrap=pwrite,--wrap=writev,--wrap=pwritev,--wrap=fsync,--wrap=fdatasync
