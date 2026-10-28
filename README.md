@@ -71,6 +71,9 @@ The build is native to Linux/WSL2 (GCC, GNU Make). There is no cross-compilation
 | `make test` | Builds and runs the smoke test (`build/plain/`). It runs the real `openchair` binary and checks its output and exit status. A failing check makes `make test` exit nonzero. |
 | `make asan` | Rebuilds in a separate tree (`build/asan/`) with AddressSanitizer + UBSan (UBSan findings are fatal) and runs the same smoke test. |
 | `make memcheck` | Runs the plain (non-sanitized) smoke test and its `openchair` children under Valgrind, failing on any error or definite/possible leak. Logs go to `build/valgrind-*.log`. Requires `valgrind` to be installed. |
+| `make test-store` | Builds and runs the `oc_store` storage tests (`tests/test_store*.c`). **Expected to fail** until the storage library is implemented (it is currently a stub); see `docs/oc_store_tests.md`. |
+| `make asan-store` | The same storage tests under ASan/UBSan. Also expected to fail until implemented. |
+| `make memcheck-store` | The same storage tests under Valgrind. It reports Valgrind errors separately from test failures. |
 | `make clean` | Removes `build/`. |
 | `make run`, `make soakcheck` | **Not available.** Print a message and exit nonzero; no application or soak test exists. |
 | `make deploy` | Does not exist. |
