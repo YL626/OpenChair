@@ -1,8 +1,8 @@
 /* Functional tests for oc_store (Mechanism D). Inputs are synthetic
  * (see test_util.h); no sensor or hardware is involved.
  *
- * Written before the implementation: against the stub in src/oc_store.c
- * every case is expected to FAIL. Run with `make test-store`. */
+ * Groups 1-9 were written before the implementation (fail-first). Run with
+ * `make test-store`, or as part of `make test`. */
 #include "test_util.h"
 
 #include "oc_crc32.h"
