@@ -14,6 +14,7 @@ All test input is synthetic and generated deterministically by `tests/test_util.
 |---|---|---|---|
 | 1 | Write and read back valid records | `tests/test_store.c` | `test_crc32_known_answers`, `test_open_fresh_dir`, `test_roundtrip_both_streams`, `test_force_sync_vs_buffered`, `test_batching_policy` |
 | 2 | Detect truncated records | `tests/test_store.c` | `test_truncation_sweep_tail` (every byte offset across the last two records), `test_truncation_sweep_head` (every offset inside the header and first record), `test_truncation_then_append` |
+| 3 | Detect corrupted record payloads | `tests/test_store.c` | `test_corrupt_payload_marker` (payload found by content), `test_corrupt_every_byte_of_record` (one bit flipped at every byte of a record: frame header, provenance, payload, CRC), `test_corrupt_first_and_last_record` |
 
 **Layout facts the corruption tests assume:**
 
