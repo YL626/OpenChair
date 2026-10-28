@@ -651,6 +651,254 @@ out:
     tu_rmrf(dir);
 }
 
+/* ===== 5. recovery across multiple segments ===== */
+
+/* Segments must hold at least one maximum-size record, so "small" here is
+ * 80 KiB with ~4 KiB records: about 20 records per segment. */
+#define MS_SEG_BYTES (80u * 1024u)
+#define MS_N 70
+
+static size_t len_4k(uint64_t seq)
+{
+    return 4000 + (size_t)(seq % 7) * 13;
+}
+
+/* A closed multi-segment evidence stream and, for each record, which
+ * segment (index in id order) holds it and where it ends in that file. */
+struct ms_store {
+    char dir[PATH_MAX];
+    struct oc_store_cfg cfg;
+    int seg_of[MS_N];
+    off_t end_of[MS_N];
+    int nseg;
+    char segs[TU_MAX_SEGS][PATH_MAX];
+};
+
+static int ms_build(struct ms_store *ms)
+{
+    struct oc_store *st = NULL;
+    int rc = -1;
+    memset(ms, 0, sizeof *ms);
+    if (tu_mkdtemp(ms->dir, sizeof ms->dir) != 0)
+        return -1;
+    ms->cfg = tu_cfg(ms->dir);
+    ms->cfg.stream[OC_STREAM_EVIDENCE].segment_bytes = MS_SEG_BYTES;
+    if (oc_store_open(&ms->cfg, &st, NULL) != 0)
+        goto done;
+    for (uint64_t i = 0; i < MS_N; i++) {
+        if (tu_append(st, OC_STREAM_EVIDENCE, i, len_4k, OC_STORE_FORCE_SYNC) != 0)
+            goto done;
+        int n = tu_list_segments(ms->dir, OC_STREAM_EVIDENCE, ms->segs, TU_MAX_SEGS);
+        if (n <= 0)
+            goto done;
+        ms->seg_of[i] = n - 1;
+        ms->end_of[i] = tu_file_size(ms->segs[n - 1]);
+    }
+    rc = 0;
+done:
+    if (oc_store_close(st) != 0)
+        rc = -1;
+    if (rc == 0) {
+        ms->nseg = tu_list_segments(ms->dir, OC_STREAM_EVIDENCE, ms->segs, TU_MAX_SEGS);
+        if (ms->nseg != ms->seg_of[MS_N - 1] + 1)
+            rc = -1;   /* close must not create or remove segments */
+    }
+    return rc;
+}
+
+/* First and one-past-last record held by segment s. */
+static void ms_range(const struct ms_store *ms, int s, uint64_t *first, uint64_t *end)
+{
+    *first = MS_N;
+    *end = 0;
+    for (uint64_t i = 0; i < MS_N; i++) {
+        if (ms->seg_of[i] == s) {
+            if (i < *first)
+                *first = i;
+            *end = i + 1;
+        }
+    }
+}
+
+/* Baseline: records span at least three segments, seq is contiguous across
+ * them, and a read can start in a middle segment. */
+static void test_multiseg_roundtrip(void)
+{
+    struct ms_store ms;
+    struct oc_store *st = NULL;
+    struct oc_store_report rep;
+    struct tu_collect c = {0};
+
+    REQUIRE(ms_build(&ms) == 0);
+    CHECK(ms.nseg >= 3);
+    REQUIRE(oc_store_open(&ms.cfg, &st, &rep) == 0);
+    CHECK(rep.stream[OC_STREAM_EVIDENCE].records_kept == MS_N);
+    CHECK(rep.stream[OC_STREAM_EVIDENCE].damaged_segments == 0);
+    CHECK(rep.stream[OC_STREAM_EVIDENCE].seq_gaps == 0);
+    CHECK(rep.stream[OC_STREAM_EVIDENCE].next_seq == MS_N);
+    REQUIRE(tu_read_all(st, OC_STREAM_EVIDENCE, len_4k, &c) == 0);
+    CHECK(tu_is_exact_range(&c, 0, MS_N));
+    tu_collect_free(&c);
+
+    uint64_t first, end;
+    ms_range(&ms, 1, &first, &end);
+    c = (struct tu_collect){.stream = OC_STREAM_EVIDENCE, .lenf = len_4k};
+    REQUIRE(oc_store_read(st, OC_STREAM_EVIDENCE, first + 1, tu_collect_visit, &c) == 0);
+    CHECK(tu_is_exact_range(&c, first + 1, MS_N - first - 1));
+out:
+    tu_collect_free(&c);
+    CHECK(oc_store_close(st) == 0);
+    tu_rmrf(ms.dir);
+}
+
+/* (a) A torn tail in the newest segment drops only its last record; every
+ * older segment is untouched. */
+static void test_multiseg_torn_newest(void)
+{
+    struct ms_store ms;
+    struct oc_store *st = NULL;
+    struct oc_store_report rep;
+    struct tu_collect c = {0};
+
+    REQUIRE(ms_build(&ms) == 0);
+    REQUIRE(ms.nseg >= 3);
+    REQUIRE(ms.seg_of[MS_N - 2] == ms.nseg - 1);   /* last two records share the newest segment */
+    REQUIRE(tu_truncate(ms.segs[ms.nseg - 1], ms.end_of[MS_N - 1] - 5) == 0);
+    REQUIRE(oc_store_open(&ms.cfg, &st, &rep) == 0);
+    const struct oc_store_stream_report *r = &rep.stream[OC_STREAM_EVIDENCE];
+    CHECK(r->records_kept == MS_N - 1);
+    CHECK(r->damaged_segments == 0);
+    CHECK(r->torn_bytes > 0);
+    CHECK(tu_file_size(ms.segs[ms.nseg - 1]) == ms.end_of[MS_N - 2]);
+    REQUIRE(tu_read_all(st, OC_STREAM_EVIDENCE, len_4k, &c) == 0);
+    CHECK(tu_is_exact_range(&c, 0, MS_N - 1));
+out:
+    tu_collect_free(&c);
+    CHECK(oc_store_close(st) == 0);
+    tu_rmrf(ms.dir);
+}
+
+/* (b) Damage inside an older, sealed segment is not a torn write: the file
+ * is kept byte-for-byte, marked damaged, and recovery continues with the
+ * later segments. The damaged record is never returned. */
+static void test_multiseg_damaged_sealed(void)
+{
+    struct ms_store ms;
+    struct oc_store *st = NULL;
+    struct oc_store_report rep;
+    struct tu_collect c = {0};
+    unsigned char *before = NULL, *after = NULL;
+    size_t blen, alen;
+
+    REQUIRE(ms_build(&ms) == 0);
+    REQUIRE(ms.nseg >= 3);
+    uint64_t first, end;
+    ms_range(&ms, 1, &first, &end);
+    uint64_t victim = first + (end - first) / 2;
+    unsigned char m[TU_MARKER_LEN];
+    tu_marker(OC_STREAM_EVIDENCE, victim, m);
+    off_t off = tu_find(ms.segs[1], m, sizeof m);
+    REQUIRE(off >= 0);
+    REQUIRE(tu_flip_bit(ms.segs[1], off + 6, 2) == 0);
+    REQUIRE(tu_read_file(ms.segs[1], &before, &blen) == 0);
+
+    REQUIRE(oc_store_open(&ms.cfg, &st, &rep) == 0);
+    const struct oc_store_stream_report *r = &rep.stream[OC_STREAM_EVIDENCE];
+    CHECK(r->damaged_segments == 1);
+    CHECK(r->seq_gaps >= 1);
+    CHECK(r->next_seq == MS_N);
+    REQUIRE(tu_read_file(ms.segs[1], &after, &alen) == 0);
+    CHECK(alen == blen && memcmp(before, after, blen) == 0);
+
+    REQUIRE(tu_read_all(st, OC_STREAM_EVIDENCE, len_4k, &c) == 0);
+    CHECK(c.bad == 0);
+    CHECK(r->records_kept == c.n);
+    /* Strictly increasing, the victim absent, and every record outside the
+     * damaged segment present. (Whether records of segment 1 before the
+     * damage are returned is open decision 6.) */
+    size_t j = 0;
+    for (uint64_t i = 0; i < MS_N; i++) {
+        int present = j < c.n && c.seqs[j] == i;
+        if (i == victim)
+            CHECK(!present);
+        else if (ms.seg_of[i] != 1)
+            CHECK(present);
+        if (present)
+            j++;
+    }
+    CHECK(j == c.n);
+out:
+    free(before);
+    free(after);
+    tu_collect_free(&c);
+    CHECK(oc_store_close(st) == 0);
+    tu_rmrf(ms.dir);
+}
+
+/* (c) The newest segment's header is damaged: it was never durably
+ * created, so it is removed and the older segments are kept. */
+static void test_multiseg_bad_newest_header(void)
+{
+    struct ms_store ms;
+    struct oc_store *st = NULL;
+    struct oc_store_report rep;
+    struct tu_collect c = {0};
+
+    REQUIRE(ms_build(&ms) == 0);
+    REQUIRE(ms.nseg >= 3);
+    uint64_t first, end;
+    ms_range(&ms, ms.nseg - 1, &first, &end);
+    REQUIRE(tu_flip_bit(ms.segs[ms.nseg - 1], 0, 0) == 0);
+    REQUIRE(oc_store_open(&ms.cfg, &st, &rep) == 0);
+    const struct oc_store_stream_report *r = &rep.stream[OC_STREAM_EVIDENCE];
+    CHECK(r->removed_segments == 1);
+    CHECK(r->damaged_segments == 0);
+    CHECK(r->records_kept == first);
+    CHECK(r->next_seq >= first);
+    CHECK(tu_file_size(ms.segs[ms.nseg - 1]) < 0);   /* file removed */
+    REQUIRE(tu_read_all(st, OC_STREAM_EVIDENCE, len_4k, &c) == 0);
+    CHECK(tu_is_exact_range(&c, 0, first));
+out:
+    tu_collect_free(&c);
+    CHECK(oc_store_close(st) == 0);
+    tu_rmrf(ms.dir);
+}
+
+/* (d) A whole middle segment is missing: the gap is reported and nothing
+ * is invented to fill it. */
+static void test_multiseg_missing_middle(void)
+{
+    struct ms_store ms;
+    struct oc_store *st = NULL;
+    struct oc_store_report rep;
+    struct tu_collect c = {0};
+
+    REQUIRE(ms_build(&ms) == 0);
+    REQUIRE(ms.nseg >= 3);
+    uint64_t first, end;
+    ms_range(&ms, 1, &first, &end);
+    REQUIRE(unlink(ms.segs[1]) == 0);
+    REQUIRE(oc_store_open(&ms.cfg, &st, &rep) == 0);
+    const struct oc_store_stream_report *r = &rep.stream[OC_STREAM_EVIDENCE];
+    CHECK(r->seq_gaps == end - first);
+    CHECK(r->records_kept == MS_N - (end - first));
+    CHECK(r->next_seq == MS_N);
+    REQUIRE(tu_read_all(st, OC_STREAM_EVIDENCE, len_4k, &c) == 0);
+    CHECK(c.bad == 0);
+    CHECK(c.n == MS_N - (end - first));
+    size_t j = 0;
+    for (uint64_t i = 0; i < MS_N && j < c.n; i++) {
+        if (i >= first && i < end)
+            continue;
+        CHECK(c.seqs[j] == i);
+        j++;
+    }
+out:
+    tu_collect_free(&c);
+    CHECK(oc_store_close(st) == 0);
+    tu_rmrf(ms.dir);
+}
+
 int main(void)
 {
     RUN(test_crc32_known_answers);
@@ -671,5 +919,11 @@ int main(void)
     RUN(test_prefix_replayed_frame);
     RUN(test_prefix_missing_middle_record);
     RUN(test_prefix_append_after_recovery);
+
+    RUN(test_multiseg_roundtrip);
+    RUN(test_multiseg_torn_newest);
+    RUN(test_multiseg_damaged_sealed);
+    RUN(test_multiseg_bad_newest_header);
+    RUN(test_multiseg_missing_middle);
     return tu_finish("test_store");
 }
