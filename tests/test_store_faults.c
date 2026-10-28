@@ -492,6 +492,61 @@ out:
     tu_rmrf(dir);   /* restores write permission first */
 }
 
+/* Recovery syncs the newest segment before open returns, so the records it
+ * keeps are durable rather than possibly still in the page cache from a
+ * crashed writer. If that sync fails, open fails; nothing is acknowledged. */
+static void test_fault_sync_at_recovery(void)
+{
+    char dir[PATH_MAX] = "";
+    struct oc_store *st = NULL;
+    int fds = tu_fd_count();
+
+    REQUIRE(tu_mkdtemp(dir, sizeof dir) == 0);
+    struct oc_store_cfg cfg = tu_cfg(dir);
+    REQUIRE(oc_store_open(&cfg, &st, NULL) == 0);
+    REQUIRE(tu_append_n(st, OC_STREAM_EVIDENCE, 0, 3, tu_len_marked, OC_STORE_FORCE_SYNC) == 0);
+    REQUIRE(oc_store_close(st) == 0);
+    st = NULL;
+
+    fi_arm(FI_SYNC, FI_REG, 0, -1, EIO);
+    CHECK(oc_store_open(&cfg, &st, NULL) == -EIO);
+    CHECK(st == NULL);
+    CHECK(fi[FI_SYNC].injected > 0);
+    CHECK(tu_fd_count() == fds);
+    check_recovered_prefix(&cfg, OC_STREAM_EVIDENCE, 3, 3);
+out:
+    fi_reset();
+    (void)oc_store_close(st);
+    CHECK(tu_fd_count() == fds);
+    tu_rmrf(dir);
+}
+
+/* Sealing writes a footer and syncs it even when every record is already
+ * durable; a failed footer sync at close is reported, not swallowed. */
+static void test_fault_sync_at_seal(void)
+{
+    char dir[PATH_MAX] = "";
+    struct oc_store *st = NULL;
+    int fds = tu_fd_count();
+
+    REQUIRE(tu_mkdtemp(dir, sizeof dir) == 0);
+    struct oc_store_cfg cfg = tu_cfg(dir);
+    REQUIRE(oc_store_open(&cfg, &st, NULL) == 0);
+    REQUIRE(tu_append_n(st, OC_STREAM_EVIDENCE, 0, 3, tu_len_marked, OC_STORE_FORCE_SYNC) == 0);
+
+    fi_arm(FI_SYNC, FI_REG, 0, -1, EIO);
+    CHECK(oc_store_close(st) == -EIO);   /* frees the store either way */
+    st = NULL;
+    CHECK(fi[FI_SYNC].injected > 0);
+    CHECK(tu_fd_count() == fds);
+    check_recovered_prefix(&cfg, OC_STREAM_EVIDENCE, 3, 3);
+out:
+    fi_reset();
+    (void)oc_store_close(st);
+    CHECK(tu_fd_count() == fds);
+    tu_rmrf(dir);
+}
+
 /* A full clean cycle, repeated, leaves no descriptor behind. */
 static void test_no_fd_leak(void)
 {
@@ -524,6 +579,8 @@ int main(void)
     RUN(test_fault_dir_fsync);
     RUN(test_fault_real_efbig);
     RUN(test_fault_real_eacces);
+    RUN(test_fault_sync_at_recovery);
+    RUN(test_fault_sync_at_seal);
     RUN(test_no_fd_leak);
     return tu_finish("test_store_faults");
 }
