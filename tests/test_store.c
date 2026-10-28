@@ -489,6 +489,168 @@ out:
     seg_image_free(&img);
 }
 
+/* ===== 4. recover the valid prefix without fabricating records ===== */
+
+/* Installs `buf` as the image's segment and checks that recovery keeps
+ * exactly records 0..k-1, ending at keep_end, and returns nothing else. */
+static int check_recovers_prefix(const struct seg_image *img,
+                                 const unsigned char *buf, size_t len,
+                                 uint64_t k, const char *what)
+{
+    int before = tu_failures;
+    char dir[PATH_MAX] = "";
+    char seg[PATH_MAX];
+    struct oc_store *st = NULL;
+    struct oc_store_report rep;
+    struct tu_collect c = {0};
+    struct seg_image mod = *img;
+    off_t keep_end = k > 0 ? img->ends[k - 1] : 0;
+
+    mod.data = (unsigned char *)buf;
+    mod.len = len;
+    REQUIRE(seg_image_install(&mod, len, dir, sizeof dir, seg) == 0);
+    struct oc_store_cfg cfg = tu_cfg(dir);
+    REQUIRE(oc_store_open(&cfg, &st, &rep) == 0);
+    const struct oc_store_stream_report *r = &rep.stream[OC_STREAM_EVIDENCE];
+    CHECK(r->records_kept == k);
+    CHECK(r->torn_bytes == (uint64_t)((off_t)len - keep_end));
+    CHECK(tu_file_size(seg) == keep_end);
+    REQUIRE(tu_read_all(st, OC_STREAM_EVIDENCE, tu_len_marked, &c) == 0);
+    CHECK(tu_is_exact_range(&c, 0, k));
+out:
+    tu_collect_free(&c);
+    CHECK(oc_store_close(st) == 0);
+    tu_rmrf(dir);
+    if (tu_failures != before)
+        fprintf(stderr, "  (case: %s)\n", what);
+    return tu_failures != before;
+}
+
+/* Builds image bytes [0, prefix) followed by `extra`, into a malloc'd buffer. */
+static unsigned char *image_plus(const struct seg_image *img, size_t prefix,
+                                 const unsigned char *extra, size_t elen)
+{
+    unsigned char *buf = malloc(prefix + elen);
+    if (buf == NULL)
+        return NULL;
+    memcpy(buf, img->data, prefix);
+    memcpy(buf + prefix, extra, elen);
+    return buf;
+}
+
+/* Garbage and zero-filled tails (what a filesystem may leave after power
+ * loss) are dropped; every real record is kept. */
+static void test_prefix_trailing_garbage(void)
+{
+    enum { N = 6, G = 300 };
+    struct seg_image img;
+    unsigned char extra[G];
+    unsigned char *buf = NULL;
+    REQUIRE(seg_image_build(N, &img) == 0);
+
+    uint32_t x = 0x12345678u;   /* fixed xorshift seed: reproducible */
+    for (size_t i = 0; i < G; i++) {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        extra[i] = (unsigned char)x;
+    }
+    buf = image_plus(&img, img.len, extra, G);
+    REQUIRE(buf != NULL);
+    CHECK(check_recovers_prefix(&img, buf, img.len + G, N, "random tail") == 0);
+    free(buf);
+
+    memset(extra, 0, sizeof extra);
+    buf = image_plus(&img, img.len, extra, G);
+    REQUIRE(buf != NULL);
+    CHECK(check_recovers_prefix(&img, buf, img.len + G, N, "zero-filled tail") == 0);
+out:
+    free(buf);
+    seg_image_free(&img);
+}
+
+/* A byte-exact copy of a valid frame has a correct CRC but a repeated seq.
+ * Accepting it would fabricate a record, so it must be rejected. */
+static void test_prefix_replayed_frame(void)
+{
+    enum { N = 6 };
+    struct seg_image img;
+    unsigned char *buf = NULL;
+    REQUIRE(seg_image_build(N, &img) == 0);
+
+    /* The last record, appended a second time. */
+    size_t flen = (size_t)(img.ends[N - 1] - img.ends[N - 2]);
+    buf = image_plus(&img, img.len, img.data + img.ends[N - 2], flen);
+    REQUIRE(buf != NULL);
+    CHECK(check_recovers_prefix(&img, buf, img.len + flen, N, "last frame repeated") == 0);
+    free(buf);
+
+    /* An earlier record (seq 2) appended at the tail. */
+    flen = (size_t)(img.ends[2] - img.ends[1]);
+    buf = image_plus(&img, img.len, img.data + img.ends[1], flen);
+    REQUIRE(buf != NULL);
+    CHECK(check_recovers_prefix(&img, buf, img.len + flen, N, "old frame replayed") == 0);
+out:
+    free(buf);
+    seg_image_free(&img);
+}
+
+/* Removing record 3 leaves record 4 directly after record 2: each frame is
+ * individually valid, but the seq jump means 4 and 5 must not be accepted
+ * as if nothing were missing from the newest segment. */
+static void test_prefix_missing_middle_record(void)
+{
+    enum { N = 6 };
+    struct seg_image img;
+    unsigned char *buf = NULL;
+    REQUIRE(seg_image_build(N, &img) == 0);
+    size_t tail = img.len - (size_t)img.ends[3];
+    buf = image_plus(&img, (size_t)img.ends[2], img.data + img.ends[3], tail);
+    REQUIRE(buf != NULL);
+    CHECK(check_recovers_prefix(&img, buf, (size_t)img.ends[2] + tail, 3,
+                                "record 3 spliced out") == 0);
+out:
+    free(buf);
+    seg_image_free(&img);
+}
+
+/* Records appended after recovery follow the kept prefix with no gap, and
+ * the dropped bytes never come back across further reopens. */
+static void test_prefix_append_after_recovery(void)
+{
+    enum { N = 6, M = 3 };
+    char dir[PATH_MAX] = "";
+    char seg[PATH_MAX];
+    struct oc_store *st = NULL;
+    struct oc_store_report rep;
+    struct seg_image img = {0};
+    struct tu_collect c = {0};
+    static const unsigned char junk[64] = {0xDE, 0xAD, 0xBE, 0xEF};
+
+    REQUIRE(seg_image_build(N, &img) == 0);
+    REQUIRE(seg_image_install(&img, img.len, dir, sizeof dir, seg) == 0);
+    REQUIRE(tu_write_file(seg, junk, sizeof junk, 1) == 0);
+    struct oc_store_cfg cfg = tu_cfg(dir);
+    REQUIRE(oc_store_open(&cfg, &st, &rep) == 0);
+    /* No record was lost, so the sequence continues at N. */
+    CHECK(rep.stream[OC_STREAM_EVIDENCE].next_seq == N);
+    REQUIRE(tu_append_n(st, OC_STREAM_EVIDENCE, N, M, tu_len_marked, OC_STORE_FORCE_SYNC) == 0);
+
+    for (int round = 0; round < 2; round++) {
+        REQUIRE(tu_reopen(&st, &cfg, &rep) == 0);
+        CHECK(rep.stream[OC_STREAM_EVIDENCE].records_kept == N + M);
+        CHECK(rep.stream[OC_STREAM_EVIDENCE].torn_bytes == 0);
+        REQUIRE(tu_read_all(st, OC_STREAM_EVIDENCE, tu_len_marked, &c) == 0);
+        CHECK(tu_is_exact_range(&c, 0, N + M));
+        tu_collect_free(&c);
+    }
+out:
+    tu_collect_free(&c);
+    CHECK(oc_store_close(st) == 0);
+    seg_image_free(&img);
+    tu_rmrf(dir);
+}
+
 int main(void)
 {
     RUN(test_crc32_known_answers);
@@ -504,5 +666,10 @@ int main(void)
     RUN(test_corrupt_payload_marker);
     RUN(test_corrupt_every_byte_of_record);
     RUN(test_corrupt_first_and_last_record);
+
+    RUN(test_prefix_trailing_garbage);
+    RUN(test_prefix_replayed_frame);
+    RUN(test_prefix_missing_middle_record);
+    RUN(test_prefix_append_after_recovery);
     return tu_finish("test_store");
 }
