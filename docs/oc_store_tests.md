@@ -13,6 +13,13 @@ All test input is synthetic and generated deterministically by `tests/test_util.
 | # | Task bullet | File | Test functions |
 |---|---|---|---|
 | 1 | Write and read back valid records | `tests/test_store.c` | `test_crc32_known_answers`, `test_open_fresh_dir`, `test_roundtrip_both_streams`, `test_force_sync_vs_buffered`, `test_batching_policy` |
+| 2 | Detect truncated records | `tests/test_store.c` | `test_truncation_sweep_tail` (every byte offset across the last two records), `test_truncation_sweep_head` (every offset inside the header and first record), `test_truncation_then_append` |
+
+**Layout facts the corruption tests assume:**
+
+- segments are named `<dir>/{evidence,trace}/NNNNNNNN.seg`;
+- payloads are stored as raw bytes;
+- a segment file is not preallocated, so its size after a sync is the end offset of the last record. This is how the tests find record boundaries without knowing the frame format.
 
 ## Why three test files
 
