@@ -319,9 +319,34 @@ static int seg_create(struct stream *s, uint32_t id, uint64_t first_seq)
     return 0;
 }
 
-/* Seals the full active segment and opens the next one. */
+/* Deletes the oldest segments of a ring stream until one more fits in
+ * max_segments. The directory is synced by the seg_create that follows; a
+ * crash in between at worst leaves a deleted segment in place. */
+static int stream_drop_oldest(struct stream *s)
+{
+    size_t drop = 0;
+    int rc = 0;
+    while (rc == 0 && s->nseg - drop >= s->cfg.max_segments) {
+        char name[SEG_NAME_LEN + 1];
+        rc = seg_name(s->segs[drop].id, name);
+        if (rc == 0 && unlinkat(s->dirfd, name, 0) != 0)
+            rc = -errno;
+        if (rc == 0)
+            drop++;
+    }
+    memmove(s->segs, s->segs + drop, (s->nseg - drop) * sizeof *s->segs);
+    s->nseg -= drop;
+    return rc;
+}
+
+/* Seals the full active segment and opens the next one. Bounded storage:
+ * evidence is never deleted, so past its cap the record is refused with
+ * -EDQUOT before any I/O and the store stays OK; trace is a ring, so its
+ * oldest segments are deleted to make room. */
 static int stream_rollover(struct oc_store *st, struct stream *s)
 {
+    if (s->id == OC_STREAM_EVIDENCE && s->nseg >= s->cfg.max_segments)
+        return -EDQUOT;
     int rc = stream_seal(st, s);
     if (rc != 0)
         return rc;
@@ -329,7 +354,13 @@ static int stream_rollover(struct oc_store *st, struct stream *s)
     s->fd = -1;
     if (rc != 0)
         return fail(st, rc);
-    rc = seg_create(s, active_seg(s)->id + 1, s->next_seq);
+    uint32_t id = active_seg(s)->id + 1;   /* before the ring may delete it */
+    if (s->id == OC_STREAM_TRACE) {
+        rc = stream_drop_oldest(s);
+        if (rc != 0)
+            return fail(st, rc);
+    }
+    rc = seg_create(s, id, s->next_seq);
     if (rc != 0)
         return fail(st, rc);
     return 0;
