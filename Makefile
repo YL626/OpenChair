@@ -36,16 +36,20 @@ ASAN_ENV := ASAN_OPTIONS=detect_leaks=1:abort_on_error=0 \
 all: $(PLAIN)/openchair
 
 test: $(PLAIN)/test_smoke $(PLAIN)/test_sample $(PLAIN)/test_light $(PLAIN)/test_i2c_linux \
-		$(PLAIN)/test_ipc_msg $(PLAIN)/test_ipc $(PLAIN)/openchair
+		$(PLAIN)/test_ipc_msg $(PLAIN)/test_ipc $(PLAIN)/test_hub_seq $(PLAIN)/test_hub \
+		$(PLAIN)/openchair
 	./$(PLAIN)/test_smoke
 	./$(PLAIN)/test_sample
 	./$(PLAIN)/test_light
 	./$(PLAIN)/test_i2c_linux
 	./$(PLAIN)/test_ipc_msg
 	./$(PLAIN)/test_ipc
+	./$(PLAIN)/test_hub_seq
+	./$(PLAIN)/test_hub
 
 asan: $(ASAN)/test_smoke $(ASAN)/test_sample $(ASAN)/test_light $(ASAN)/test_i2c_linux \
-		$(ASAN)/test_ipc_msg $(ASAN)/test_ipc $(ASAN)/openchair
+		$(ASAN)/test_ipc_msg $(ASAN)/test_ipc $(ASAN)/test_hub_seq $(ASAN)/test_hub \
+		$(ASAN)/openchair
 	ASAN_OPTIONS=detect_leaks=1:abort_on_error=0 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
 		./$(ASAN)/test_smoke
 	$(ASAN_ENV) ./$(ASAN)/test_sample
@@ -53,6 +57,8 @@ asan: $(ASAN)/test_smoke $(ASAN)/test_sample $(ASAN)/test_light $(ASAN)/test_i2c
 	$(ASAN_ENV) ./$(ASAN)/test_i2c_linux
 	$(ASAN_ENV) ./$(ASAN)/test_ipc_msg
 	$(ASAN_ENV) ./$(ASAN)/test_ipc
+	$(ASAN_ENV) ./$(ASAN)/test_hub_seq
+	$(ASAN_ENV) ./$(ASAN)/test_hub
 
 memcheck: $(PLAIN)/test_smoke $(PLAIN)/openchair
 	@command -v valgrind >/dev/null || { echo "memcheck: valgrind not installed" >&2; exit 1; }
@@ -124,6 +130,24 @@ asan-ipc: $(addprefix $(ASAN)/,$(IPC_TESTS))
 
 memcheck-ipc: $(addprefix $(PLAIN)/,$(IPC_TESTS))
 	@command -v valgrind >/dev/null || { echo "memcheck-ipc: valgrind not installed" >&2; exit 1; }
+	@rc=0; for t in $^; do valgrind -q --error-exitcode=99 --leak-check=full \
+		--errors-for-leak-kinds=definite,possible ./$$t || rc=1; done; exit $$rc
+
+# Hub receiver tests: pure sequence tracker, and the hub over REAL AF_UNIX
+# SOCK_SEQPACKET sockets with SIMULATED samples (no hardware). test_hub wraps
+# send() to inject one ACK send failure (default: call the real send).
+.PHONY: test-hub asan-hub memcheck-hub
+$(PLAIN)/test_hub $(ASAN)/test_hub: LDWRAP := -Wl,--wrap=send
+HUB_TESTS := test_hub_seq test_hub
+
+test-hub: $(addprefix $(PLAIN)/,$(HUB_TESTS))
+	@rc=0; for t in $^; do ./$$t || rc=1; done; exit $$rc
+
+asan-hub: $(addprefix $(ASAN)/,$(HUB_TESTS))
+	@rc=0; for t in $^; do $(ASAN_ENV) ./$$t || rc=1; done; exit $$rc
+
+memcheck-hub: $(addprefix $(PLAIN)/,$(HUB_TESTS))
+	@command -v valgrind >/dev/null || { echo "memcheck-hub: valgrind not installed" >&2; exit 1; }
 	@rc=0; for t in $^; do valgrind -q --error-exitcode=99 --leak-check=full \
 		--errors-for-leak-kinds=definite,possible ./$$t || rc=1; done; exit $$rc
 
