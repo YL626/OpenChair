@@ -1116,6 +1116,143 @@ out:
     tu_rmrf(dir);
 }
 
+/* ===== 9. bounded storage: trace ring, evidence cap ===== */
+
+#define RING_SEGS 3
+
+/* Number of segment files of a stream, or -1. */
+static int seg_count(const char *dir, enum oc_stream s)
+{
+    char paths[TU_MAX_SEGS][PATH_MAX];
+    return tu_list_segments(dir, s, paths, TU_MAX_SEGS);
+}
+
+/* The trace stream is a ring of max_segments files: the oldest segment is
+ * deleted to make room, the stream never holds more files than that, what
+ * remains is a contiguous run ending at the newest record, and dropping
+ * the oldest records is not reported as a gap. Rotation continues across a
+ * reopen. */
+static void test_trace_ring_rotation(void)
+{
+    enum { N1 = 200, N2 = 60 };
+    char dir[PATH_MAX] = "";
+    struct oc_store *st = NULL;
+    struct oc_store_report rep;
+    struct tu_collect c = {0};
+
+    REQUIRE(tu_mkdtemp(dir, sizeof dir) == 0);
+    struct oc_store_cfg cfg = tu_cfg(dir);
+    cfg.stream[OC_STREAM_TRACE].segment_bytes = MS_SEG_BYTES;   /* ~20 records each */
+    cfg.stream[OC_STREAM_TRACE].max_segments = RING_SEGS;
+    REQUIRE(oc_store_open(&cfg, &st, NULL) == 0);
+
+    int max_seen = 0;
+    for (uint64_t i = 0; i < N1; i++) {
+        REQUIRE(tu_append(st, OC_STREAM_TRACE, i, len_4k, OC_STORE_FORCE_SYNC) == 0);
+        int n = seg_count(dir, OC_STREAM_TRACE);
+        if (n > max_seen)
+            max_seen = n;
+    }
+    CHECK(max_seen == RING_SEGS);   /* reached the ring length, never exceeded it */
+
+    REQUIRE(tu_read_all(st, OC_STREAM_TRACE, len_4k, &c) == 0);
+    REQUIRE(c.n > 0);
+    uint64_t first1 = c.seqs[0];
+    CHECK(first1 > 0);   /* the oldest records were rotated out */
+    CHECK(tu_is_exact_range(&c, first1, N1 - first1));
+    tu_collect_free(&c);
+
+    /* The evidence stream is unaffected by trace rotation. */
+    CHECK(seg_count(dir, OC_STREAM_EVIDENCE) == 1);
+
+    REQUIRE(tu_reopen(&st, &cfg, &rep) == 0);
+    const struct oc_store_stream_report *r = &rep.stream[OC_STREAM_TRACE];
+    CHECK(r->records_kept == N1 - first1);
+    CHECK(r->seq_gaps == 0);
+    CHECK(r->damaged_segments == 0);
+    CHECK(r->next_seq == N1);
+
+    REQUIRE(tu_append_n(st, OC_STREAM_TRACE, N1, N2, len_4k, OC_STORE_FORCE_SYNC) == 0);
+    CHECK(seg_count(dir, OC_STREAM_TRACE) == RING_SEGS);
+    REQUIRE(tu_read_all(st, OC_STREAM_TRACE, len_4k, &c) == 0);
+    REQUIRE(c.n > 0);
+    CHECK(c.seqs[0] > first1);
+    CHECK(tu_is_exact_range(&c, c.seqs[0], N1 + N2 - c.seqs[0]));
+out:
+    tu_collect_free(&c);
+    CHECK(oc_store_close(st) == 0);
+    tu_rmrf(dir);
+}
+
+/* The evidence stream has a hard cap of max_segments files and never
+ * deletes: an append that would need a segment past the cap is refused
+ * with -EDQUOT, consumes no seq and leaves *seq_out alone, while the store
+ * stays OK, every accepted record stays readable, and the trace stream
+ * keeps working. The cap still holds after a reopen. */
+static void test_evidence_cap(void)
+{
+    enum { CAP_SEGS = 2, LIMIT = 200 };
+    char dir[PATH_MAX] = "";
+    char paths[TU_MAX_SEGS][PATH_MAX];
+    struct oc_store *st = NULL;
+    struct oc_store_report rep;
+    struct oc_store_status ss;
+    struct tu_collect c = {0};
+    unsigned char body[4000];
+    const struct oc_prov prov = tu_prov(1);
+
+    REQUIRE(tu_mkdtemp(dir, sizeof dir) == 0);
+    struct oc_store_cfg cfg = tu_cfg(dir);
+    cfg.stream[OC_STREAM_EVIDENCE].segment_bytes = MS_SEG_BYTES;
+    cfg.stream[OC_STREAM_EVIDENCE].max_segments = CAP_SEGS;
+    REQUIRE(oc_store_open(&cfg, &st, NULL) == 0);
+
+    uint64_t n = 0;
+    int rc = 0;
+    while (n < LIMIT && (rc = tu_append(st, OC_STREAM_EVIDENCE, n, len_4k,
+                                        OC_STORE_FORCE_SYNC)) == 0)
+        n++;
+    CHECK(rc == -EDQUOT);
+    CHECK(n > 20 && n < LIMIT);   /* more than one segment's worth was accepted */
+    CHECK(seg_count(dir, OC_STREAM_EVIDENCE) == CAP_SEGS);
+
+    /* Refused again; no seq consumed, *seq_out untouched. */
+    uint64_t seq = 777;
+    tu_payload(OC_STREAM_EVIDENCE, n, body, sizeof body);
+    CHECK(oc_store_append(st, OC_STREAM_EVIDENCE, OC_REC_EVENT, &prov, body, sizeof body,
+                          OC_STORE_FORCE_SYNC, &seq) == -EDQUOT);
+    CHECK(seq == 777);
+
+    /* Not a failure: the store is OK, nothing is uncertain, every accepted
+     * record is durable, and the trace stream still accepts records. */
+    REQUIRE(oc_store_status(st, &ss) == 0);
+    CHECK(ss.state == OC_STORE_OK);
+    CHECK(ss.last_errno == 0);
+    CHECK(ss.stream[OC_STREAM_EVIDENCE].durable == n);
+    CHECK(ss.stream[OC_STREAM_EVIDENCE].uncertain == 0);
+    CHECK(ss.stream[OC_STREAM_EVIDENCE].durable_seq == n - 1);
+    CHECK(tu_append(st, OC_STREAM_TRACE, 0, len_4k, OC_STORE_FORCE_SYNC) == 0);
+
+    REQUIRE(tu_read_all(st, OC_STREAM_EVIDENCE, len_4k, &c) == 0);
+    CHECK(tu_is_exact_range(&c, 0, n));
+    tu_collect_free(&c);
+
+    /* After a reopen: nothing was deleted, everything is kept, and the cap
+     * still refuses the next record. */
+    REQUIRE(tu_reopen(&st, &cfg, &rep) == 0);
+    CHECK(rep.stream[OC_STREAM_EVIDENCE].records_kept == n);
+    CHECK(rep.stream[OC_STREAM_EVIDENCE].next_seq == n);
+    REQUIRE(tu_list_segments(dir, OC_STREAM_EVIDENCE, paths, TU_MAX_SEGS) == CAP_SEGS);
+    CHECK(strcmp(strrchr(paths[0], '/') + 1, "00000000.seg") == 0);
+    CHECK(tu_append(st, OC_STREAM_EVIDENCE, n, len_4k, OC_STORE_FORCE_SYNC) == -EDQUOT);
+    REQUIRE(tu_read_all(st, OC_STREAM_EVIDENCE, len_4k, &c) == 0);
+    CHECK(tu_is_exact_range(&c, 0, n));
+out:
+    tu_collect_free(&c);
+    CHECK(oc_store_close(st) == 0);
+    tu_rmrf(dir);
+}
+
 int main(void)
 {
     RUN(test_crc32_known_answers);
@@ -1146,5 +1283,8 @@ int main(void)
     RUN(test_invalid_open);
     RUN(test_invalid_append);
     RUN(test_invalid_other_calls);
+
+    RUN(test_trace_ring_rotation);
+    RUN(test_evidence_cap);
     return tu_finish("test_store");
 }
