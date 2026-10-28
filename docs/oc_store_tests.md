@@ -1,10 +1,12 @@
 # oc_store test suite and open storage decisions
 
-Owner: Kacper (Mechanism D, DESIGN.md §7). Everything here is **[REVIEW]** until the `oc_store` interface is reviewed by Alan as its consumer. `DESIGN.md` is authoritative. This file maps the tests to the M2 storage task and records the decisions the tests depend on.
+Owner: Kacper (Mechanism D, DESIGN.md §7). Everything here is **[REVIEW]** until the `oc_store` interface is reviewed by Alan as its consumer. `DESIGN.md` is authoritative. This file maps the tests to the M2 storage task. The on-disk format, sync policy, recovery rules and the open decisions are in [`docs/oc_store.md`](oc_store.md).
 
 ## Status
 
-The tests were written **before** the implementation. `src/oc_store.c` and `src/crc32.c` are stubs: every store call returns `-ENOSYS` and the CRC returns 0. So `make test-store`, `make asan-store` and `make memcheck-store` are **expected to fail** until the implementation lands. `make test` (the smoke test) is unaffected. Once the store tests pass they move into `make test`.
+Tests 1–9 were written **before** the implementation (fail-first). Against the original `-ENOSYS` stubs every group failed. With `src/oc_store.c`, `src/oc_store_format.c` and `src/crc32.c` implemented, all three binaries pass. They run as part of `make test`, `make asan` and `make memcheck`, and on their own with `make test-store`, `make asan-store` and `make memcheck-store`.
+
+Two tests in group 7, `test_fault_sync_at_recovery` and `test_fault_sync_at_seal`, were added **after** the implementation. A mutation check found them missing: deleting either sync left every other test green. With the sync deleted they fail; with the code as committed they pass.
 
 All test input is synthetic and generated deterministically by `tests/test_util.h`. No test result here is evidence of hardware behaviour.
 
@@ -18,8 +20,9 @@ All test input is synthetic and generated deterministically by `tests/test_util.
 | 4 | Recover the valid prefix without fabricating records | `tests/test_store.c` | `test_prefix_trailing_garbage` (random and zero-filled tails), `test_prefix_replayed_frame` (byte-exact valid frames with repeated seqs), `test_prefix_missing_middle_record` (valid frames after a seq gap in the newest segment), `test_prefix_append_after_recovery` |
 | 5 | Recovery across multiple segments | `tests/test_store.c` | `test_multiseg_roundtrip` (≥3 segments, contiguous seq), `test_multiseg_torn_newest`, `test_multiseg_damaged_sealed` (older segment kept byte-identical and marked damaged), `test_multiseg_bad_newest_header` (newest segment removed), `test_multiseg_missing_middle` (gap reported, nothing invented) |
 | 6 | Invalid inputs | `tests/test_store.c` | `test_invalid_open` (bad cfg → `-EINVAL` with nothing created; missing dir → `-ENOENT`; file as dir → `-ENOTDIR`), `test_invalid_append` (every bad argument → `-EINVAL`, no seq consumed, state unchanged; empty and maximum payloads accepted), `test_invalid_other_calls` (NULL handles, bad stream, NULL visitor, read past end, visitor stop value propagated) |
-| 7 | Write failures | `tests/test_store_faults.c` | `test_fault_sync_eio_batched`, `test_fault_sync_eio_force_sync` (failed sync → FAILED, records uncertain, `durable_seq` not advanced, never success again on that handle, recovery keeps an intact prefix containing every acknowledged record), `test_fault_write_enospc`, `test_fault_short_write_and_eintr` (must be retried, data intact), `test_fault_dir_fsync` (at open and at segment rollover), `test_fault_real_efbig` and `test_fault_real_eacces` (real kernel errors, no mocking), `test_no_fd_leak`; every test also checks its descriptor count is unchanged |
+| 7 | Write failures | `tests/test_store_faults.c` | `test_fault_sync_eio_batched`, `test_fault_sync_eio_force_sync` (failed sync → FAILED, records uncertain, `durable_seq` not advanced, never success again on that handle, recovery keeps an intact prefix containing every acknowledged record), `test_fault_write_enospc`, `test_fault_short_write_and_eintr` (must be retried, data intact), `test_fault_dir_fsync` (at open and at segment rollover), `test_fault_real_efbig` and `test_fault_real_eacces` (real kernel errors, no mocking), `test_fault_sync_at_recovery` (open fails if recovery's sync fails), `test_fault_sync_at_seal` (a failed footer sync at close is reported), `test_no_fd_leak`; every test also checks its descriptor count is unchanged |
 | 8 | Process-kill tests (and what they do and do not prove) | `tests/test_store_kill.c` | `test_kill_force_sync` (20 trials), `test_kill_batched` (10 trials), `test_kill_repeated_same_store` (8 crash/restart rounds on one store) |
+| 9 | Bounded storage (open decision 10) | `tests/test_store.c` | `test_trace_ring_rotation` (trace never exceeds `max_segments` files, keeps a contiguous suffix, reports no gap for rotated-out records, rotates across a reopen), `test_evidence_cap` (past the cap: `-EDQUOT`, no seq consumed, store stays OK, trace unaffected, nothing deleted, cap holds after reopen) |
 
 **Fault-injection seam (test 7).**
 
@@ -57,44 +60,9 @@ The tests are split by **what they need from the harness**, not one file per cas
   - that the SD card or ext4 honour flush;
   - torn or reordered sector writes (covered instead by the truncation and bit-flip tests);
   - the DESIGN.md §6 target of ≥ 1,000 trials, which belongs to the evaluation.
-- *Before the implementation exists:* the fork/ack/kill harness can't be exercised against the stub, because the child exits at `open` before any kill. It will be exercised for the first time when the implementation lands.
+- *Evidence cap:* children write until the kill lands, so over 8 rounds they would reach the default 16-segment evidence cap and exit 3 ("append failed"). The trials therefore set `max_segments = 100000`. The cap itself is tested in group 9. A child that still hits it fails the trial loudly.
+- *Stability:* 20 of 20 repeated runs of `test_store_kill` passed (Fedora, GCC 16.2.1, tmpfs `/tmp`). The whole suite also passes with `TMPDIR` on a btrfs disk, where `fdatasync` is real (about 33 s instead of 3 s). Not yet run on ext4 or the Pi's SD card.
 
-## Proposed on-disk format [REVIEW]
+## Format, sync policy and open decisions
 
-All integers are little-endian. Encoding uses explicit byte functions, never struct `memcpy`.
-
-- **Directory:** `<dir>/evidence/` and `<dir>/trace/`. Segment files are named `NNNNNNNN.seg` (8-digit decimal segment id).
-- **Segment header, 32 B:** magic `"OCSG"`, format version u16, stream u8, reserved u8, segment id u32, first record seq u64, reserved (zero) u32×2, header CRC32 u32.
-- **Record frame:**
-  - a 16 B frame header: magic u16 `0x5243` ("CR"), type u8, version u8, payload length u32, record seq u64;
-  - a 16 B provenance block: kind u8, origin u8, emitter u8, flags u8, instance u32, session_id u64;
-  - the payload body;
-  - CRC32 u32 over the frame header + provenance + payload.
-
-  The payload is stored raw, which the tests rely on.
-- **Footer** (when sealed): magic `"OCFT"`, record count u32, last seq u64, CRC32 u32.
-- **CRC:** CRC-32/IEEE (reflected `0xEDB88320`, init and xorout `0xFFFFFFFF`), the zlib CRC. Check value: `"123456789"` → `0xCBF43926`.
-- **Max payload:** `OC_STORE_MAX_PAYLOAD` = 64 KiB.
-
-## Sync policy (from DESIGN.md §4, Notes §5/§8)
-
-- `append` only buffers the record. `OC_STORE_FORCE_SYNC` writes and `fdatasync`s it before returning.
-- `tick` syncs a stream once 32 records are pending, or 500 ms after it first saw pending records.
-- To open a new segment: write the header, `fdatasync` it, `fsync` the directory, then append.
-- To seal a segment: write the footer and sync it.
-- Deleting a segment is followed by a directory `fsync`.
-
-## Open decisions for partner review
-
-The tests are written so that they don't silently settle these. Where a test does depend on one, this list says so.
-
-1. **First seq is 0** for each stream, and seqs are **per stream**. Tests 1+ depend on this.
-2. **Errors are negative errno.** Invalid arguments return `-EINVAL` and never change state. `oc_store_sync` on an empty stream returns `-ENODATA`.
-3. **Batch timer** starts at the first `tick` that sees pending records (tick time is supplied by the hub). `test_batching_policy` depends on this.
-4. **Seq after torn-tail truncation**: should lost seqs be reused or skipped? Tests only assert that the next seq is greater than the last kept seq.
-5. **Does `read` see buffered/unsynced records?** Tests only read after a sync.
-6. **`read` inside a damaged sealed segment**: should it return the valid records before the damage? Tests only assert that no corrupt record is returned and that other segments are complete.
-7. **`close` writing a shutdown record**: tests tolerate extra records after the last user record.
-8. **Fault-injection seam**: link-time `--wrap` (no production API change) vs an I/O hook table in `oc_store_cfg`.
-9. **INJECTED as a provenance flag** (`OC_PROV_INJECTED`) rather than a field only in EVENT payloads.
-10. **Evidence cap / trace ring rotation**: not yet tested; planned for a follow-up commit.
+These moved to [`docs/oc_store.md`](oc_store.md) when the implementation landed. The layout facts listed above, which the corruption tests rely on, still hold.

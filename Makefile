@@ -21,8 +21,8 @@ ASAN := $(BUILD)/asan
 PLAIN_LIB_OBJ := $(addprefix $(PLAIN)/,$(LIB_NAMES))
 ASAN_LIB_OBJ := $(addprefix $(ASAN)/,$(LIB_NAMES))
 
-# oc_store tests. Written before the implementation: until src/oc_store.c is
-# real these targets are EXPECTED TO FAIL. They move into `make test` once green.
+# oc_store tests (docs/oc_store_tests.md). Run by test/asan/memcheck, and on
+# their own by test-store/asan-store/memcheck-store.
 STORE_TESTS := test_store test_store_faults test_store_kill
 # Fault-injection seam: the faults binary routes oc_store's write/sync calls
 # through __wrap_* functions in tests/test_store_faults.c.
@@ -35,20 +35,25 @@ ASAN_ENV := ASAN_OPTIONS=detect_leaks=1:abort_on_error=0 \
 
 all: $(PLAIN)/openchair
 
-test: $(PLAIN)/test_smoke $(PLAIN)/test_sample $(PLAIN)/test_light $(PLAIN)/test_i2c_linux $(PLAIN)/openchair
+
+all: $(PLAIN)/openchair
+
+test: $(PLAIN)/test_smoke $(PLAIN)/test_sample $(PLAIN)/test_light $(PLAIN)/test_i2c_linux $(PLAIN)/openchair test-store
 	./$(PLAIN)/test_smoke
 	./$(PLAIN)/test_sample
 	./$(PLAIN)/test_light
 	./$(PLAIN)/test_i2c_linux
 
-asan: $(ASAN)/test_smoke $(ASAN)/test_sample $(ASAN)/test_light $(ASAN)/test_i2c_linux $(ASAN)/openchair
+asan: $(ASAN)/test_smoke $(ASAN)/test_sample $(ASAN)/test_light $(ASAN)/test_i2c_linux $(ASAN)/openchair asan-store
 	ASAN_OPTIONS=detect_leaks=1:abort_on_error=0 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
 		./$(ASAN)/test_smoke
 	$(ASAN_ENV) ./$(ASAN)/test_sample
 	$(ASAN_ENV) ./$(ASAN)/test_light
 	$(ASAN_ENV) ./$(ASAN)/test_i2c_linux
 
-memcheck: $(PLAIN)/test_smoke $(PLAIN)/openchair
+
+
+memcheck: $(PLAIN)/test_smoke $(PLAIN)/openchair memcheck-store
 	@command -v valgrind >/dev/null || { echo "memcheck: valgrind not installed" >&2; exit 1; }
 	valgrind --error-exitcode=1 --leak-check=full --errors-for-leak-kinds=definite,possible \
 		--trace-children=yes --log-file=$(BUILD)/valgrind-%p.log ./$(PLAIN)/test_smoke
