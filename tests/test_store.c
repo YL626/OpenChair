@@ -398,6 +398,97 @@ out:
     tu_rmrf(dir);
 }
 
+/* ===== 3. detect corrupted record payloads ===== */
+
+/* Reopens the image with one bit flipped at `off` (inside record k) and
+ * checks that recovery keeps exactly records 0..k-1. The image is the
+ * newest segment, so everything from the first invalid record on is
+ * dropped. Returns nonzero if any check failed. */
+static int check_flipped_at(const struct seg_image *img, off_t off, uint64_t k)
+{
+    int before = tu_failures;
+    char dir[PATH_MAX] = "";
+    char seg[PATH_MAX];
+    struct oc_store *st = NULL;
+    struct oc_store_report rep;
+    struct tu_collect c = {0};
+    off_t keep_end = k > 0 ? img->ends[k - 1] : 0;
+
+    REQUIRE(seg_image_install(img, img->len, dir, sizeof dir, seg) == 0);
+    REQUIRE(tu_flip_bit(seg, off, (int)(off % 8)) == 0);
+    struct oc_store_cfg cfg = tu_cfg(dir);
+    REQUIRE(oc_store_open(&cfg, &st, &rep) == 0);
+    const struct oc_store_stream_report *r = &rep.stream[OC_STREAM_EVIDENCE];
+    CHECK(r->records_kept == k);
+    CHECK(r->damaged_segments == 0);
+    if (k > 0) {
+        CHECK(r->torn_bytes == (uint64_t)((off_t)img->len - keep_end));
+        CHECK(tu_file_size(seg) == keep_end);
+    }
+    REQUIRE(tu_read_all(st, OC_STREAM_EVIDENCE, tu_len_marked, &c) == 0);
+    CHECK(tu_is_exact_range(&c, 0, k));
+out:
+    tu_collect_free(&c);
+    CHECK(oc_store_close(st) == 0);
+    tu_rmrf(dir);
+    if (tu_failures != before)
+        fprintf(stderr, "  (bit %d flipped at offset %lld, record %llu)\n",
+                (int)(off % 8), (long long)off, (unsigned long long)k);
+    return tu_failures != before;
+}
+
+/* The payload marker is located by content, so this does not depend on the
+ * frame format: flipping any bit of it must invalidate the record. */
+static void test_corrupt_payload_marker(void)
+{
+    enum { N = 8, K = 4 };
+    struct seg_image img;
+    unsigned char m[TU_MARKER_LEN];
+    REQUIRE(seg_image_build(N, &img) == 0);
+    tu_marker(OC_STREAM_EVIDENCE, K, m);
+    const unsigned char *hit = memmem(img.data, img.len, m, sizeof m);
+    REQUIRE(hit != NULL);
+    off_t off = (off_t)(hit - img.data);
+    REQUIRE(off >= img.ends[K - 1] && off + TU_MARKER_LEN <= img.ends[K]);
+    for (int i = 0; i < TU_MARKER_LEN; i += 5)
+        CHECK(check_flipped_at(&img, off + i, K) == 0);
+    /* A byte in the body after the marker. */
+    CHECK(check_flipped_at(&img, off + TU_MARKER_LEN + 10, K) == 0);
+out:
+    seg_image_free(&img);
+}
+
+/* Every byte of a middle record, including its frame header, provenance
+ * block and CRC: a single flipped bit anywhere must be detected. */
+static void test_corrupt_every_byte_of_record(void)
+{
+    enum { N = 8, K = 5 };
+    struct seg_image img;
+    REQUIRE(seg_image_build(N, &img) == 0);
+    for (off_t off = img.ends[K - 1]; off < img.ends[K]; off++) {
+        if (check_flipped_at(&img, off, K) != 0)
+            break;   /* one diagnosed offset is enough */
+    }
+out:
+    seg_image_free(&img);
+}
+
+/* Damage to the first and the last record. */
+static void test_corrupt_first_and_last_record(void)
+{
+    enum { N = 5 };
+    struct seg_image img;
+    unsigned char m[TU_MARKER_LEN];
+    REQUIRE(seg_image_build(N, &img) == 0);
+    tu_marker(OC_STREAM_EVIDENCE, 0, m);
+    const unsigned char *hit = memmem(img.data, img.len, m, sizeof m);
+    REQUIRE(hit != NULL);
+    CHECK(check_flipped_at(&img, (off_t)(hit - img.data) + 3, 0) == 0);
+    CHECK(check_flipped_at(&img, img.ends[N - 1] - 1, N - 1) == 0);
+out:
+    seg_image_free(&img);
+}
+
 int main(void)
 {
     RUN(test_crc32_known_answers);
@@ -409,5 +500,9 @@ int main(void)
     RUN(test_truncation_sweep_tail);
     RUN(test_truncation_sweep_head);
     RUN(test_truncation_then_append);
+
+    RUN(test_corrupt_payload_marker);
+    RUN(test_corrupt_every_byte_of_record);
+    RUN(test_corrupt_first_and_last_record);
     return tu_finish("test_store");
 }
