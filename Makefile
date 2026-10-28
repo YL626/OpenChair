@@ -35,12 +35,14 @@ ASAN_ENV := ASAN_OPTIONS=detect_leaks=1:abort_on_error=0 \
 
 all: $(PLAIN)/openchair
 
-test: $(PLAIN)/test_smoke $(PLAIN)/openchair
+test: $(PLAIN)/test_smoke $(PLAIN)/test_sample $(PLAIN)/openchair
 	./$(PLAIN)/test_smoke
+	./$(PLAIN)/test_sample
 
-asan: $(ASAN)/test_smoke $(ASAN)/openchair
+asan: $(ASAN)/test_smoke $(ASAN)/test_sample $(ASAN)/openchair
 	ASAN_OPTIONS=detect_leaks=1:abort_on_error=0 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
 		./$(ASAN)/test_smoke
+	$(ASAN_ENV) ./$(ASAN)/test_sample
 
 memcheck: $(PLAIN)/test_smoke $(PLAIN)/openchair
 	@command -v valgrind >/dev/null || { echo "memcheck: valgrind not installed" >&2; exit 1; }
@@ -64,6 +66,19 @@ memcheck-store: $(addprefix $(PLAIN)/,$(STORE_TESTS))
 	done; \
 	echo "memcheck-store: valgrind errors: $$verr, test failures: $$tfail; logs in $(BUILD)/valgrind-store-*.log"; \
 	[ $$verr -eq 0 ] && [ $$tfail -eq 0 ]
+
+# oc_sample codec tests (no hardware, no storage dependency).
+.PHONY: test-sample asan-sample memcheck-sample
+
+test-sample: $(PLAIN)/test_sample
+	./$<
+
+asan-sample: $(ASAN)/test_sample
+	$(ASAN_ENV) ./$<
+
+memcheck-sample: $(PLAIN)/test_sample
+	@command -v valgrind >/dev/null || { echo "memcheck-sample: valgrind not installed" >&2; exit 1; }
+	valgrind -q --error-exitcode=99 --leak-check=full --errors-for-leak-kinds=definite,possible ./$<
 
 run:
 	@echo "NOT AVAILABLE: no application exists yet (only a scaffold CLI)." >&2; exit 1
