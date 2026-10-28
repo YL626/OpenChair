@@ -200,6 +200,204 @@ out:
     tu_rmrf(dir);
 }
 
+/* ===== shared fixture: one evidence segment with known record ends ===== */
+
+/* A captured evidence segment and the file offset at which each record ends,
+ * measured as the segment size after that record's FORCE_SYNC. */
+struct seg_image {
+    char name[NAME_MAX + 1];   /* basename, e.g. 00000000.seg */
+    unsigned char *data;
+    size_t len;
+    off_t *ends;               /* ends[i]: end offset of record i */
+    uint64_t n;
+};
+
+static void seg_image_free(struct seg_image *img)
+{
+    free(img->data);
+    free(img->ends);
+    *img = (struct seg_image){0};
+}
+
+/* Writes n FORCE_SYNC records (tu_len_marked) to a fresh store, captures the
+ * single evidence segment, and removes the store directory. */
+static int seg_image_build(uint64_t n, struct seg_image *img)
+{
+    char dir[PATH_MAX] = "";
+    char seg[PATH_MAX];
+    struct oc_store *st = NULL;
+    int rc = -1;
+
+    *img = (struct seg_image){.n = n};
+    img->ends = calloc(n, sizeof *img->ends);
+    if (img->ends == NULL || tu_mkdtemp(dir, sizeof dir) != 0)
+        goto done;
+    struct oc_store_cfg cfg = tu_cfg(dir);
+    if (oc_store_open(&cfg, &st, NULL) != 0)
+        goto done;
+    for (uint64_t i = 0; i < n; i++) {
+        if (tu_append(st, OC_STREAM_EVIDENCE, i, tu_len_marked, OC_STORE_FORCE_SYNC) != 0 ||
+            tu_newest_segment(dir, OC_STREAM_EVIDENCE, seg) != 0)
+            goto done;
+        img->ends[i] = tu_file_size(seg);
+    }
+    /* Capture before close, so the image is exactly what a crash leaves. */
+    char paths[TU_MAX_SEGS][PATH_MAX];
+    if (tu_list_segments(dir, OC_STREAM_EVIDENCE, paths, TU_MAX_SEGS) != 1)
+        goto done;
+    const char *base = strrchr(seg, '/');
+    base = base != NULL ? base + 1 : seg;
+    if (strlen(base) >= sizeof img->name)
+        goto done;
+    memcpy(img->name, base, strlen(base) + 1);
+    if (tu_read_file(seg, &img->data, &img->len) != 0)
+        goto done;
+    rc = 0;
+done:
+    (void)oc_store_close(st);
+    tu_rmrf(dir);
+    if (rc != 0)
+        seg_image_free(img);
+    return rc;
+}
+
+/* Recreates a store directory whose evidence stream holds the first `len`
+ * bytes of the image. */
+static int seg_image_install(const struct seg_image *img, size_t len,
+                             char *dir, size_t cap, char *seg)
+{
+    char sdir[PATH_MAX];
+    if (tu_mkdtemp(dir, cap) != 0 ||
+        tu_path(sdir, sizeof sdir, dir, "evidence") != 0 ||
+        mkdir(sdir, 0700) != 0 ||
+        tu_path(seg, PATH_MAX, sdir, img->name) != 0)
+        return -1;
+    return tu_write_file(seg, img->data, len, 0);
+}
+
+/* Number of records that end at or before offset `cut`. */
+static uint64_t records_before(const struct seg_image *img, off_t cut)
+{
+    uint64_t k = 0;
+    while (k < img->n && img->ends[k] <= cut)
+        k++;
+    return k;
+}
+
+/* ===== 2. detect truncated records ===== */
+
+/* Reopens the image truncated at `cut` and checks recovery kept exactly the
+ * records that were whole. Returns nonzero if any check failed. */
+static int check_truncated_at(const struct seg_image *img, off_t cut,
+                              int header_intact)
+{
+    int before = tu_failures;
+    char dir[PATH_MAX] = "";
+    char seg[PATH_MAX];
+    struct oc_store *st = NULL;
+    struct oc_store_report rep;
+    struct tu_collect c = {0};
+    uint64_t k = records_before(img, cut);
+
+    REQUIRE(seg_image_install(img, (size_t)cut, dir, sizeof dir, seg) == 0);
+    struct oc_store_cfg cfg = tu_cfg(dir);
+    REQUIRE(oc_store_open(&cfg, &st, &rep) == 0);
+    const struct oc_store_stream_report *r = &rep.stream[OC_STREAM_EVIDENCE];
+    CHECK(r->records_kept == k);
+    CHECK(r->damaged_segments == 0);
+    if (header_intact && k > 0) {
+        /* The torn tail is cut back to the last whole record, in place. */
+        CHECK(r->torn_bytes == (uint64_t)(cut - img->ends[k - 1]));
+        CHECK(tu_file_size(seg) == img->ends[k - 1]);
+        CHECK(r->next_seq >= k);
+    }
+    REQUIRE(tu_read_all(st, OC_STREAM_EVIDENCE, tu_len_marked, &c) == 0);
+    CHECK(tu_is_exact_range(&c, 0, k));
+out:
+    tu_collect_free(&c);
+    CHECK(oc_store_close(st) == 0);
+    tu_rmrf(dir);
+    if (tu_failures != before)
+        fprintf(stderr, "  (truncated at offset %lld of %zu)\n", (long long)cut, img->len);
+    return tu_failures != before;
+}
+
+/* Cut at every byte offset across the last two records, including both
+ * exact record boundaries. */
+static void test_truncation_sweep_tail(void)
+{
+    enum { N = 10 };
+    struct seg_image img;
+    REQUIRE(seg_image_build(N, &img) == 0);
+    REQUIRE(img.ends[N - 1] == (off_t)img.len);
+    for (off_t cut = img.ends[N - 3]; cut <= img.ends[N - 1]; cut++) {
+        if (check_truncated_at(&img, cut, 1) != 0)
+            break;   /* one diagnosed cut point is enough */
+    }
+out:
+    seg_image_free(&img);
+}
+
+/* Cuts inside the segment header and the first record: nothing is kept,
+ * open still succeeds, and the stream accepts new records. */
+static void test_truncation_sweep_head(void)
+{
+    enum { N = 3 };
+    struct seg_image img;
+    REQUIRE(seg_image_build(N, &img) == 0);
+    for (off_t cut = 0; cut < img.ends[0]; cut++) {
+        if (check_truncated_at(&img, cut, 0) != 0)
+            break;
+    }
+out:
+    seg_image_free(&img);
+}
+
+/* After a torn tail is dropped, new records are appended after the kept
+ * prefix and the dropped bytes never reappear. */
+static void test_truncation_then_append(void)
+{
+    enum { N = 6 };
+    char dir[PATH_MAX] = "";
+    char seg[PATH_MAX];
+    struct oc_store *st = NULL;
+    struct oc_store_report rep;
+    struct seg_image img = {0};
+    struct tu_collect c = {0};
+
+    REQUIRE(seg_image_build(N, &img) == 0);
+    off_t cut = img.ends[N - 2] + (img.ends[N - 1] - img.ends[N - 2]) / 2;
+    REQUIRE(seg_image_install(&img, (size_t)cut, dir, sizeof dir, seg) == 0);
+    struct oc_store_cfg cfg = tu_cfg(dir);
+    REQUIRE(oc_store_open(&cfg, &st, &rep) == 0);
+    CHECK(rep.stream[OC_STREAM_EVIDENCE].records_kept == N - 1);
+
+    uint64_t next = rep.stream[OC_STREAM_EVIDENCE].next_seq;
+    CHECK(next >= N - 1);
+    struct oc_prov prov = tu_prov(0);
+    static const char body[] = "after-recovery";
+    uint64_t got = 0;
+    REQUIRE(oc_store_append(st, OC_STREAM_EVIDENCE, OC_REC_EVENT, &prov, body,
+                            sizeof body, OC_STORE_FORCE_SYNC, &got) == 0);
+    CHECK(got == next);
+
+    REQUIRE(tu_reopen(&st, &cfg, &rep) == 0);
+    c = (struct tu_collect){.stream = OC_STREAM_EVIDENCE, .lenf = tu_len_marked};
+    REQUIRE(oc_store_read(st, OC_STREAM_EVIDENCE, 0, tu_collect_visit, &c) == 0);
+    /* N-1 generated records, then the new one (which the generator does not
+     * describe, so it is counted as one mismatch). */
+    CHECK(c.n == N);
+    CHECK(c.bad == 1);
+    for (size_t i = 0; i + 1 < c.n && i < N - 1; i++)
+        CHECK(c.seqs[i] == i);
+    CHECK(c.n == N && c.seqs[N - 1] == got);
+out:
+    tu_collect_free(&c);
+    CHECK(oc_store_close(st) == 0);
+    seg_image_free(&img);
+    tu_rmrf(dir);
+}
+
 int main(void)
 {
     RUN(test_crc32_known_answers);
@@ -207,5 +405,9 @@ int main(void)
     RUN(test_roundtrip_both_streams);
     RUN(test_force_sync_vs_buffered);
     RUN(test_batching_policy);
+
+    RUN(test_truncation_sweep_tail);
+    RUN(test_truncation_sweep_head);
+    RUN(test_truncation_then_append);
     return tu_finish("test_store");
 }
