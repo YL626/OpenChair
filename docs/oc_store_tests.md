@@ -18,6 +18,16 @@ All test input is synthetic and generated deterministically by `tests/test_util.
 | 4 | Recover the valid prefix without fabricating records | `tests/test_store.c` | `test_prefix_trailing_garbage` (random and zero-filled tails), `test_prefix_replayed_frame` (byte-exact valid frames with repeated seqs), `test_prefix_missing_middle_record` (valid frames after a seq gap in the newest segment), `test_prefix_append_after_recovery` |
 | 5 | Recovery across multiple segments | `tests/test_store.c` | `test_multiseg_roundtrip` (≥3 segments, contiguous seq), `test_multiseg_torn_newest`, `test_multiseg_damaged_sealed` (older segment kept byte-identical and marked damaged), `test_multiseg_bad_newest_header` (newest segment removed), `test_multiseg_missing_middle` (gap reported, nothing invented) |
 | 6 | Invalid inputs | `tests/test_store.c` | `test_invalid_open` (bad cfg → `-EINVAL` with nothing created; missing dir → `-ENOENT`; file as dir → `-ENOTDIR`), `test_invalid_append` (every bad argument → `-EINVAL`, no seq consumed, state unchanged; empty and maximum payloads accepted), `test_invalid_other_calls` (NULL handles, bad stream, NULL visitor, read past end, visitor stop value propagated) |
+| 7 | Write failures | `tests/test_store_faults.c` | `test_fault_sync_eio_batched`, `test_fault_sync_eio_force_sync` (failed sync → FAILED, records uncertain, `durable_seq` not advanced, never success again on that handle, recovery keeps an intact prefix containing every acknowledged record), `test_fault_write_enospc`, `test_fault_short_write_and_eintr` (must be retried, data intact), `test_fault_dir_fsync` (at open and at segment rollover), `test_fault_real_efbig` and `test_fault_real_eacces` (real kernel errors, no mocking), `test_no_fd_leak`; every test also checks its descriptor count is unchanged |
+
+**Fault-injection seam (test 7).**
+
+- *How it works:* the faults binary is linked with `-Wl,--wrap=` for `write`, `pwrite`, `writev`, `pwritev`, `fsync` and `fdatasync`. `oc_store`'s calls go through `__wrap_*` functions, which pass through unless a test arms a rule. Rules can target regular files or directories, and each armed test checks that its rule actually fired, so an implementation that writes another way fails instead of passing vacuously.
+- *Verified:* a probe confirmed the redirection works for calls from a separately compiled object, in both plain and ASan builds.
+- *Caveats:*
+  - On a 32-bit build with `_FILE_OFFSET_BITS=64`, glibc renames `pwrite`/`pwritev` to `*64`, so the wrap list would need those names.
+  - Under `-std=c23`, the implementation needs `_POSIX_C_SOURCE 200809L` (or `_GNU_SOURCE`) to declare `fdatasync`.
+- *Limits:* it can't reproduce real SD-card I/O errors or the kernel's handling of dirty pages after a genuine failed fsync. It checks only that `oc_store` reports failures honestly and never acknowledges durability it didn't get.
 
 **Layout facts the corruption tests assume:**
 

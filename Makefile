@@ -23,7 +23,10 @@ ASAN_LIB_OBJ := $(addprefix $(ASAN)/,$(LIB_NAMES))
 
 # oc_store tests. Written before the implementation: until src/oc_store.c is
 # real these targets are EXPECTED TO FAIL. They move into `make test` once green.
-STORE_TESTS := test_store
+STORE_TESTS := test_store test_store_faults
+# Fault-injection seam: the faults binary routes oc_store's write/sync calls
+# through __wrap_* functions in tests/test_store_faults.c.
+STORE_WRAP := -Wl,--wrap=write,--wrap=pwrite,--wrap=writev,--wrap=pwritev,--wrap=fsync,--wrap=fdatasync
 ASAN_ENV := ASAN_OPTIONS=detect_leaks=1:abort_on_error=0 \
 	UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1
 
@@ -92,6 +95,8 @@ $(ASAN)/test_smoke: $(TEST)/test_smoke.c $(ASAN_LIB_OBJ) | $(ASAN)
 	$(CC) $(CFLAGS_ASAN) $(LDFLAGS_ASAN) -DOPENCHAIR_BIN='"./$(ASAN)/openchair"' $< $(ASAN_LIB_OBJ) -o $@
 
 # --- oc_store test binaries (LDWRAP is set per target for fault injection) ---
+$(PLAIN)/test_store_faults $(ASAN)/test_store_faults: LDWRAP := $(STORE_WRAP)
+
 $(PLAIN)/test_%: $(TEST)/test_%.c $(PLAIN_LIB_OBJ) | $(PLAIN)
 	$(CC) $(CFLAGS_PLAIN) $< $(PLAIN_LIB_OBJ) $(LDWRAP) -o $@
 
