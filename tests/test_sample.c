@@ -68,7 +68,8 @@ static void test_constants(void)
     CHECK(OC_PROTO_VERSION == 1u);
     CHECK(OC_SOURCE_LIGHT == 1 && OC_SOURCE_DISTANCE == 2);
     CHECK(OC_ST_OK == 1 && OC_ST_SATURATED == 2 && OC_ST_NACK == 3 &&
-          OC_ST_TIMEOUT == 4 && OC_ST_RANGE_ERR == 5 && OC_ST_STALE == 6);
+          OC_ST_TIMEOUT == 4 && OC_ST_RANGE_ERR == 5 && OC_ST_STALE == 6 &&
+          OC_ST_IO_ERR == 7);   /* IO_ERR: pending shared change, see oc_sample.h */
     CHECK(OC_MSG_HELLO == 1 && OC_MSG_HELLO_ACK == 2 &&
           OC_MSG_HELLO_REJECT == 3 && OC_MSG_SAMPLE == 4 && OC_MSG_BYE == 5);
     /* Shared with oc_store.h: must not be redefined here. */
@@ -101,7 +102,7 @@ static void test_sample_roundtrip_all_valid_enums(void)
                                       OC_ORIGIN_REPLAYED};
     for (size_t i = 0; i < sizeof sources; i++)
         for (size_t j = 0; j < sizeof origins; j++)
-            for (uint8_t st = OC_ST_OK; st <= OC_ST_STALE; st++) {
+            for (uint8_t st = OC_ST_OK; st <= OC_ST_IO_ERR; st++) {
                 struct oc_sample s = good();
                 s.source = sources[i];
                 s.origin = origins[j];
@@ -165,7 +166,7 @@ static void test_sample_encode_rejects_invalid(void)
     bad[n] = good(); bad[n++].origin = OC_ORIGIN_MIXED;
     bad[n] = good(); bad[n++].origin = OC_ORIGIN_NONE;
     bad[n] = good(); bad[n].value = 0; bad[n++].status = 0;
-    bad[n] = good(); bad[n].value = 0; bad[n++].status = OC_ST_STALE + 1;
+    bad[n] = good(); bad[n].value = 0; bad[n++].status = OC_ST_IO_ERR + 1;
     bad[n] = good(); bad[n].value = 0; bad[n++].status = 255;
     bad[n] = good(); bad[n].status = OC_ST_TIMEOUT; bad[n++].value = 7; /* non-OK needs value 0 */
     for (int i = 0; i < n; i++) {
@@ -184,7 +185,9 @@ static void test_sample_validate(void)
     CHECK(oc_sample_validate(&s) == 0);
     s.status = OC_ST_STALE; s.value = 0;
     CHECK(oc_sample_validate(&s) == 0);
-    s.status = OC_ST_STALE + 1;
+    s.status = OC_ST_IO_ERR;
+    CHECK(oc_sample_validate(&s) == 0);
+    s.status = OC_ST_IO_ERR + 1;
     CHECK(oc_sample_validate(&s) == -EINVAL);
     s = good(); s.origin = OC_ORIGIN_MIXED;
     CHECK(oc_sample_validate(&s) == -EINVAL);
@@ -238,7 +241,7 @@ static void test_sample_decode_rejects(void)
     }
     /* status */
     /* value zeroed so that only the status range check can reject these */
-    uint8_t bad_status[] = {0, 7, 255};
+    uint8_t bad_status[] = {0, OC_ST_IO_ERR + 1, 255};
     for (size_t i = 0; i < sizeof bad_status; i++) {
         memcpy(m, golden_payload, sizeof m);
         m[14] = bad_status[i];
