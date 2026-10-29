@@ -14,6 +14,7 @@
 #include "oc_capture.h"
 #include "oc_role_hub.h"
 #include "oc_role_reader.h"
+#include "oc_store.h"   /* enum oc_origin */
 
 /* ---------- option table ---------- */
 
@@ -24,7 +25,7 @@
 #define R_ALL (R_HUB | R_READER)
 
 enum opt_id {
-    O_SIMULATE, O_UNSUP, O_DROPCONN, O_DIR, O_SESSION, O_INSTANCE, O_LIGHT_INST,
+    O_SIMULATE, O_INPUT, O_I2C_DEV, O_UNSUP, O_DROPCONN, O_DIR, O_SESSION, O_INSTANCE, O_LIGHT_INST,
     O_DIST_INST, O_PERIOD, O_STAT, O_LIFETIME, O_FAULT, O_HELLO_TO, O_HEADROOM,
     O_CAP_DIR, O_CAP_MS, O_CAP_ARM, O_CAP_FRESH, O_CAP_SEG, O_CAP_TSEG, O_FSIZE,
     O_COUNT
@@ -39,6 +40,8 @@ struct optdef {
 
 static const struct optdef OPTS[] = {
     {"--simulate", false, R_ALL, O_SIMULATE},
+    {"--input", true, R_ALL, O_INPUT},
+    {"--i2c-dev", true, R_READER, O_I2C_DEV},
     {"--unsupervised-test", false, R_HUB, O_UNSUP},
     {"--drop-conn-on-sigusr1", false, R_READER, O_DROPCONN},
     {"--runtime-dir", true, R_ALL, O_DIR},
@@ -123,7 +126,30 @@ static int apply_opt(struct oc_role_opts *o, const struct optdef *d, const char 
 {
     uint64_t v = 0;
     switch (d->id) {
-    case O_SIMULATE: o->simulate = true; return 0;
+    case O_SIMULATE:
+        if (o->input == OC_INPUT_LIVE)
+            return fail(err, errcap, "--simulate conflicts with --input live", nullptr);
+        o->input = OC_INPUT_SIM;
+        return 0;
+    case O_INPUT:
+        if (strcmp(val, "sim") == 0) {
+            if (o->input == OC_INPUT_LIVE)
+                return fail(err, errcap, "--input sim conflicts with --input live", nullptr);
+            o->input = OC_INPUT_SIM;
+        } else if (strcmp(val, "live") == 0) {
+            if (o->input == OC_INPUT_SIM)
+                return fail(err, errcap, "--input live conflicts with --simulate/--input sim",
+                            nullptr);
+            o->input = OC_INPUT_LIVE;
+        } else {
+            return fail(err, errcap, "--input must be sim or live", val);
+        }
+        return 0;
+    case O_I2C_DEV:
+        if (val[0] != '/')
+            return fail(err, errcap, "--i2c-dev must be an absolute path", val);
+        o->i2c_dev = val;
+        return 0;
     case O_UNSUP: o->unsupervised_test = true; return 0;
     case O_DROPCONN: o->drop_conn_on_sigusr1 = true; return 0;
     case O_DIR:
@@ -241,8 +267,6 @@ int oc_role_parse(int argc, char **argv, struct oc_role_opts *o, char *err, size
         o->role = OC_ROLE_NONE;
         return fail(err, errcap, "unknown role", argv[2]);
     }
-    o->period_ms = o->role == OC_ROLE_LIGHT ? 20 : 50;
-
     bool seen[O_COUNT] = {false};
     for (int i = 3; i < argc; i++) {
         const struct optdef *d = nullptr;
@@ -269,8 +293,21 @@ int oc_role_parse(int argc, char **argv, struct oc_role_opts *o, char *err, size
         }
     }
 
-    if (!seen[O_SIMULATE])
-        return fail(err, errcap, "--simulate is required (S3C has no LIVE mode)", nullptr);
+    if (o->input == OC_INPUT_NONE)
+        return fail(err, errcap, "--input sim|live (or --simulate) is required", nullptr);
+    o->simulate = o->input == OC_INPUT_SIM;
+    if (o->input == OC_INPUT_LIVE) {
+        /* Fault injection is for simulated testing only. */
+        if (seen[O_FAULT] || seen[O_DROPCONN] || seen[O_HEADROOM] || seen[O_FSIZE])
+            return fail(err, errcap, "fault-injection options require --input sim", nullptr);
+        if (o->role != OC_ROLE_HUB && o->i2c_dev == nullptr)
+            o->i2c_dev = OC_I2C_DEV_DEFAULT;
+    } else if (seen[O_I2C_DEV]) {
+        return fail(err, errcap, "--i2c-dev requires --input live", nullptr);
+    }
+    if (!seen[O_PERIOD])
+        o->period_ms = o->role == OC_ROLE_LIGHT ? 20
+                       : o->input == OC_INPUT_LIVE ? OC_PERIOD_LIVE_DISTANCE_MS : 50;
     if (!seen[O_DIR])
         return fail(err, errcap, "--runtime-dir is required", nullptr);
     if (!seen[O_SESSION])
@@ -354,9 +391,25 @@ int oc_role_socket_path(const struct oc_role_opts *o, char *out, size_t cap)
     return 0;
 }
 
+const char *oc_role_origin_name(uint8_t origin)
+{
+    switch (origin) {
+    case OC_ORIGIN_LIVE: return "LIVE";
+    case OC_ORIGIN_SIMULATED: return "SIMULATED";
+    case OC_ORIGIN_REPLAYED: return "REPLAYED";
+    default: return "?";
+    }
+}
+
+uint8_t oc_role_input_origin(enum oc_input_mode m)
+{
+    return m == OC_INPUT_LIVE ? OC_ORIGIN_LIVE : m == OC_INPUT_SIM ? OC_ORIGIN_SIMULATED : 0;
+}
+
 void oc_role_usage(FILE *out)
 {
-    fputs("usage: openchair --role hub --simulate --unsupervised-test --runtime-dir DIR\n"
+    fputs("usage: openchair --role hub (--input sim|live | --simulate) --unsupervised-test\n"
+          "                 --runtime-dir DIR\n"
           "                 --session-id HEX [--light-instance N] [--distance-instance N]\n"
           "                 [--stat-ms N] [--lifetime-ms N]\n"
           "                 [--capture-dir DIR [--capture-ms N] [--capture-arm-timeout-ms N]\n"
@@ -364,13 +417,16 @@ void oc_role_usage(FILE *out)
           "                 [--hello-timeout-ms N] [--test-fd-headroom N]   (testing)\n"
           "                 [--capture-segment-bytes N] [--capture-trace-segments N]\n"
           "                 [--test-fsize-limit BYTES]                      (testing)\n"
-          "       openchair --role light|distance --simulate --runtime-dir DIR\n"
-          "                 --session-id HEX --instance N [--period-ms N] [--stat-ms N]\n"
-          "                 [--lifetime-ms N] [--fault-every N]\n"
-          "                 [--drop-conn-on-sigusr1]                        (testing)\n"
+          "       openchair --role light|distance (--input sim|live | --simulate)\n"
+          "                 --runtime-dir DIR --session-id HEX --instance N\n"
+          "                 [--i2c-dev PATH]   (live only; default " OC_I2C_DEV_DEFAULT ")\n"
+          "                 [--period-ms N] [--stat-ms N] [--lifetime-ms N]\n"
+          "                 [--fault-every N] [--drop-conn-on-sigusr1]      (sim only, testing)\n"
           "       openchair --role help\n"
-          "S3C roles: all samples are SIMULATED; the hub's authorized instances come\n"
-          "from the flags above (test configuration, not supervisor authorization).\n",
+          "Input mode is explicit: sim = synthetic readings (origin SIMULATED), live = real\n"
+          "ADS1115/VL6180X over I2C (origin LIVE). The hub and its readers must agree. The hub's\n"
+          "authorized instances come from the flags above (test configuration, not supervisor\n"
+          "authorization). Fault-injection options are rejected with --input live.\n",
           out);
 }
 

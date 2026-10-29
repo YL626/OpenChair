@@ -4,14 +4,25 @@
 /* oc_role: role dispatch for the single openchair executable (S3C).
  *
  *   openchair --role hub      ...   the hub process
- *   openchair --role light    ...   a SIMULATED light reader
- *   openchair --role distance ...   a SIMULATED distance reader
+ *   openchair --role light    ...   a light reader (SIMULATED or LIVE)
+ *   openchair --role distance ...   a distance reader (SIMULATED or LIVE)
  *   openchair --role help           role usage on stdout, exit 0
  *
  * --version and --help are handled by main() and are unchanged; role options
  * are documented by `--role help` and in README.md, not in --help.
  *
- * STATUS: S3C testing roles. Every sample is SIMULATED. There is no LIVE mode.
+ * STATUS: S3C testing roles plus M3-B. The input mode is mandatory and explicit:
+ *   --input sim | --input live     (--simulate is an alias for --input sim)
+ * Giving --simulate together with --input live is a conflict and is rejected.
+ * SIM readers take synthetic readings from oc_sim_source; LIVE readers read the
+ * real ADS1115 / VL6180X through oc_i2c_linux (--i2c-dev, default /dev/i2c-1).
+ * The hub is told the mode too and authorizes exactly that origin for both
+ * sources, so a SIMULATED reader cannot feed a LIVE hub or the reverse. A LIVE
+ * reader never falls back to simulation: a hardware error is reported as a
+ * non-OK sample, and an I2C device that cannot be opened is exit 3.
+ * Nothing in this repository's host tests is LIVE evidence; LIVE means "the
+ * Linux I2C transport was used", which on a host without the sensors yields
+ * NACK/TIMEOUT samples, never data.
  * The hub's authorized instances come from explicit command-line flags that
  * only exist for testing (--unsupervised-test); this is NOT supervisor
  * authorization, and no authorization message crosses a process boundary.
@@ -20,10 +31,12 @@
  * permanent HELLO rejection, 4 runtime failure (including a critical report
  * that could not be delivered).
  *
- * Testing controls (readers, only with --simulate; hub, only with
- * --unsupervised-test): --fault-every, --drop-conn-on-sigusr1,
- * --hello-timeout-ms, --test-fd-headroom, --lifetime-ms, --capture-segment-bytes,
- * --capture-trace-segments, --test-fsize-limit.
+ * Testing controls (hub: only with --unsupervised-test). Fault injection is
+ * restricted to --input sim: --fault-every, --drop-conn-on-sigusr1,
+ * --test-fd-headroom, --test-fsize-limit are rejected with --input live.
+ * Usable in LIVE demonstrations until the supervisor exists: --lifetime-ms,
+ * --unsupervised-test, --hello-timeout-ms, --capture-segment-bytes,
+ * --capture-trace-segments.
  *
  * Capture mode (hub only, --capture-dir): see oc_capture.h. The capture
  * directory holds persistent evidence and must be separate from the runtime
@@ -45,9 +58,20 @@ enum oc_role_kind {
     OC_ROLE_DISTANCE
 };
 
+enum oc_input_mode {
+    OC_INPUT_NONE = 0,
+    OC_INPUT_SIM,
+    OC_INPUT_LIVE
+};
+
+#define OC_I2C_DEV_DEFAULT "/dev/i2c-1"
+#define OC_PERIOD_LIVE_DISTANCE_MS 150   /* conservative starting value, unmeasured [MEASURE] */
+
 struct oc_role_opts {
     enum oc_role_kind role;
-    bool simulate;
+    enum oc_input_mode input;        /* always SIM or LIVE after a successful parse */
+    bool simulate;                   /* input == SIM (kept for existing callers) */
+    const char *i2c_dev;             /* readers, LIVE only; OC_I2C_DEV_DEFAULT if not given */
     bool unsupervised_test;          /* hub: acknowledges test-only authorization */
     bool drop_conn_on_sigusr1;       /* readers: testing control */
     const char *runtime_dir;         /* points into argv; absolute */
@@ -88,6 +112,11 @@ bool oc_role_paths_overlap(const char *a, const char *b);
 /* "<runtime_dir>/hub.sock" into out. 0, or -ENAMETOOLONG (does not fit
  * sockaddr_un) / -EINVAL. */
 int oc_role_socket_path(const struct oc_role_opts *o, char *out, size_t cap);
+
+/* "LIVE" / "SIMULATED" / "REPLAYED" / "?" for an enum oc_origin value, and the origin a mode
+ * stands for (enum oc_origin; 0 for OC_INPUT_NONE). */
+const char *oc_role_origin_name(uint8_t origin);
+uint8_t oc_role_input_origin(enum oc_input_mode m);
 
 void oc_role_usage(FILE *out);
 

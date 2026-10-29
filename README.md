@@ -60,7 +60,8 @@ Mechanisms E (multiprocess fault isolation) and D (custom crash-consistent stora
 │   ├── oc_store.md       # storage format, sync policy, recovery, open decisions
 │   └── oc_store_tests.md # storage test map
 ├── tools/
-│   └── distance_probe.c  # live VL6180X bring-up probe (make probe)
+│   ├── distance_probe.c  # live VL6180X bring-up probe (make probe)
+│   └── light_probe.c     # live ADS1115/ALS-PT19 bring-up probe (make probe-light)
 ├── tests/                # automated tests
 │   ├── test_smoke.c      # smoke test of the scaffold CLI
 │   ├── test_store.c      # oc_store functional tests
@@ -96,25 +97,31 @@ The build is native to Linux/WSL2 (GCC, GNU Make). There is no cross-compilation
 | `make test-roles` / `asan-roles` | Unit tests of the pure S3C modules (backoff, simulated source, option parsing). |
 | `make test-distance` / `asan-distance` / `memcheck-distance` | Runs only the VL6180X driver and distance-adapter tests (`tests/test_distance.c`) against a **simulated** sensor. Also part of `make test` and `make asan`; see `docs/vl6180x.md`. |
 | `make probe` | Builds `build/plain/distance_probe`, a live bring-up tool that reads the VL6180X over `/dev/i2c-N` and prints timestamped LIVE samples. It only reads a real sensor on the Pi; the procedure is in `docs/vl6180x.md` §4. |
+| `make probe-light` | Builds `build/plain/light_probe`, a live bring-up tool that reads the ADS1115 (ALS-PT19 on A0) over `/dev/i2c-N` and prints timestamped raw ADC readings. Only reads a real sensor on the Pi; see `docs/light_probe.md`. |
+| `make test-live` / `asan-live` / `memcheck-live` | M3-B input-mode scenarios (real processes; **no hardware is read**): origin enforcement between hub and readers, refusal to run on a missing I2C device, and the reader loop over a *fake* bus (reconnect, non-OK samples, LIVE-labelled capture). Part of `make test` / `make asan`. The backend unit tests (`tests/test_reader_backend.c`) run under `make test-roles`. |
 | `make clean` | Removes `build/`. |
 | `make run`, `make soakcheck` | **Not available.** Print a message and exit nonzero; no application or soak test exists. |
 | `make deploy` | Does not exist. |
 
-### S3C role processes (SIMULATED only)
+### Role processes (SIMULATED by default; LIVE since M3-B, host-tested only)
 
-`openchair --version` and `--help` are unchanged. The same executable can also run as one of three cooperating processes. Everything these roles produce is **SIMULATED**: there is no hardware, no LIVE mode, no supervisor and no storage. They exist to exercise the IPC transport and the hub state machine across real Linux processes.
+`openchair --version` and `--help` are unchanged. The same executable can also run as one of three cooperating processes. The input mode is explicit: `--input sim` (or the alias `--simulate`) gives synthetic readings labelled **SIMULATED**; `--input live` reads the real ADS1115 and VL6180X over I2C and labels them **LIVE**. The LIVE path is covered by host tests against fakes only; **no LIVE reading has been taken on the Pi**, and passing host tests is not hardware evidence. There is still no supervisor.
 
 ```
-openchair --role hub --simulate --unsupervised-test --runtime-dir DIR --session-id HEX
+openchair --role hub --input sim|live --unsupervised-test --runtime-dir DIR --session-id HEX
           [--light-instance N] [--distance-instance N] [--stat-ms N] [--lifetime-ms N]
-openchair --role light|distance --simulate --runtime-dir DIR --session-id HEX --instance N
+openchair --role light|distance --input sim|live --runtime-dir DIR --session-id HEX --instance N
+          [--i2c-dev PATH]   # live only, default /dev/i2c-1
           [--period-ms N] [--stat-ms N] [--lifetime-ms N]
 openchair --role help        # full option list, including the testing controls
 ```
 
 - `DIR` is a caller-created directory (mode 0700, owned by you); the hub listens on `DIR/hub.sock`.
 - **The hub's session id and authorized instances are explicit command-line test configuration** (`--unsupervised-test`). This is not supervisor authorization; no authorization message crosses a process boundary in S3C. The supervisor (S4) will draw the session id and allocate a fresh instance per spawned reader.
-- Testing controls, available only with `--simulate` / `--unsupervised-test`: `--fault-every N` (every Nth attempt is a TIMEOUT), `--drop-conn-on-sigusr1` (SIGUSR1 makes a reader drop its socket and reconnect in the same process, keeping instance and sequence), `--hello-timeout-ms`, `--test-fd-headroom N` (hub lowers `RLIMIT_NOFILE` after start-up so only N more descriptors can be opened).
+- **The hub and its readers must use the same mode.** The hub authorizes exactly one origin for both sources, so a SIMULATED reader is rejected by a LIVE hub (and the reverse) with `BAD_ORIGIN`, exit 3. Conflicting mode options (`--simulate` with `--input live`) and `--i2c-dev` without `--input live` are usage errors.
+- LIVE readers: the I2C device is opened once and kept across hub reconnects. If it cannot be opened the reader exits 3 and sends nothing. A hardware error becomes a non-OK sample (`NACK`/`TIMEOUT`/`IO_ERR`, value 0, counted in `non_ok=`); a LIVE reader never falls back to simulation. Default periods: light 20 ms, distance 150 ms in LIVE mode (50 ms simulated); both unmeasured starting values, set with `--period-ms`. `--lifetime-ms` and `--unsupervised-test` stay available for controlled LIVE demonstrations until the supervisor exists.
+- Fault injection is simulated-only: `--fault-every`, `--drop-conn-on-sigusr1`, `--test-fd-headroom` and `--test-fsize-limit` are rejected with `--input live`.
+- Testing controls, available only with `--input sim` / `--unsupervised-test`: `--fault-every N` (every Nth attempt is a TIMEOUT), `--drop-conn-on-sigusr1` (SIGUSR1 makes a reader drop its socket and reconnect in the same process, keeping instance and sequence), `--hello-timeout-ms`, `--test-fd-headroom N` (hub lowers `RLIMIT_NOFILE` after start-up so only N more descriptors can be opened).
 - Each process prints `key=value` lines on stdout: `READY`, `STAT`/`SRC`, `EVENT`, `SUMMARY`. `READY` and `SUMMARY` are delivered with a bounded retry and a failure to deliver them makes the process exit 4; routine lines are dropped (and counted) rather than queued if the reader of the pipe is slow. A process killed with SIGKILL writes no `SUMMARY`.
 - Exit codes: 0 clean, 2 usage, 3 configuration or permanent HELLO rejection, 4 runtime failure.
 

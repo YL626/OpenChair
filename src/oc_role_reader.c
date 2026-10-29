@@ -13,13 +13,14 @@
 #include "oc_ipc.h"
 #include "oc_runlog.h"
 #include "oc_sample.h"
-#include "oc_sim_source.h"
+#include "oc_reader_backend.h"
 
 #define MS_NS 1000000ull
 
 struct counters {
     uint64_t attempted, sent, unsent_disc, bp_drop, send_fail;
     uint64_t overruns;
+    uint64_t non_ok;                /* sent-or-not attempts whose sample status was not OK */
     uint64_t connect_attempts, connects, disconnects, rejects;
 };
 
@@ -33,7 +34,7 @@ struct reader {
     int sfd;
     struct oc_ipc_conn conn;
     struct oc_backoff bo;
-    uint32_t next_seq;
+    struct oc_reader_backend *be;   /* owns the sample sequence and the I2C fd; lives across reconnects */
     bool was_up;                    /* a connection was established since the last backoff reset */
     uint64_t up_since_ns;
     uint64_t next_connect_ns, next_tick_ns, next_stat_ns, end_ns;
@@ -78,29 +79,32 @@ static void fail_critical(struct reader *r, const char *what, int rc)
 static void format_counters(const struct reader *r, bool up, char *buf, size_t cap)
 {
     snprintf(buf, cap,
-             "role=%s origin=SIMULATED inst=%u up=%d attempted=%llu sent=%llu "
+             "role=%s origin=%s inst=%u up=%d attempted=%llu sent=%llu "
              "unsent_disc=%llu bp_drop=%llu send_fail=%llu overruns=%llu "
              "connect_attempts=%llu connects=%llu disconnects=%llu rejects=%llu "
-             "next_seq=%u log_dropped=%llu",
-             r->name, r->o->instance, up ? 1 : 0, (unsigned long long)r->c.attempted,
+             "non_ok=%llu next_seq=%u log_dropped=%llu",
+             r->name, oc_role_origin_name(r->be->origin), r->o->instance, up ? 1 : 0,
+             (unsigned long long)r->c.attempted,
              (unsigned long long)r->c.sent, (unsigned long long)r->c.unsent_disc,
              (unsigned long long)r->c.bp_drop, (unsigned long long)r->c.send_fail,
              (unsigned long long)r->c.overruns, (unsigned long long)r->c.connect_attempts,
              (unsigned long long)r->c.connects, (unsigned long long)r->c.disconnects,
-             (unsigned long long)r->c.rejects, r->next_seq, (unsigned long long)r->log.dropped);
+             (unsigned long long)r->c.rejects, (unsigned long long)r->c.non_ok,
+             oc_reader_backend_next_seq(r->be), (unsigned long long)r->log.dropped);
 }
 
 static void emit_stat(struct reader *r)
 {
-    char buf[400];
+    char buf[440];
     format_counters(r, r->conn.open, buf, sizeof buf);
     (void)oc_runlog_line(&r->log, "STAT %s", buf);
 }
 
 static void emit_event(struct reader *r, const char *ev, const char *extra)
 {
-    (void)oc_runlog_line(&r->log, "EVENT role=%s origin=SIMULATED inst=%u ev=%s%s%s", r->name,
-                         r->o->instance, ev, extra ? " " : "", extra ? extra : "");
+    (void)oc_runlog_line(&r->log, "EVENT role=%s origin=%s inst=%u ev=%s%s%s", r->name,
+                         oc_role_origin_name(r->be->origin), r->o->instance, ev, extra ? " " : "",
+                         extra ? extra : "");
 }
 
 /* A failed attempt or lost connection: pick the next attempt time. */
@@ -136,7 +140,7 @@ static void try_connect(struct reader *r)
     struct oc_hello_reject rej = {0};
     if (rc == 0 || rc == -EINPROGRESS) {
         const struct oc_hello hello = {.source = r->source,
-                                       .origin = OC_ORIGIN_SIMULATED,
+                                       .origin = r->be->origin,
                                        .session_id = r->o->session_id,
                                        .instance = r->o->instance,
                                        .pid = (uint32_t)getpid()};
@@ -153,10 +157,12 @@ static void try_connect(struct reader *r)
         if (!r->ready_sent) {
             r->ready_sent = true;
             int lrc = oc_runlog_critical(&r->log, OC_READER_CRITICAL_MS,
-                                         "READY role=%s origin=SIMULATED pid=%d inst=%u "
-                                         "session=%llx",
-                                         r->name, (int)getpid(), r->o->instance,
-                                         (unsigned long long)r->o->session_id);
+                                         "READY role=%s origin=%s pid=%d inst=%u "
+                                         "session=%llx%s%s",
+                                         r->name, oc_role_origin_name(r->be->origin), (int)getpid(),
+                                         r->o->instance, (unsigned long long)r->o->session_id,
+                                         r->o->input == OC_INPUT_LIVE ? " i2c_dev=" : "",
+                                         r->o->input == OC_INPUT_LIVE ? r->o->i2c_dev : "");
             if (lrc != 0)
                 fail_critical(r, "READY", lrc);
         }
@@ -198,21 +204,23 @@ static void do_tick(struct reader *r, uint64_t now)
     }
     r->next_tick_ns += r->period_ns;
 
-    struct oc_sim_reading rd;
-    if (oc_sim_reading(r->source, r->next_seq, r->o->fault_every, &rd) != 0) {
+    /* The backend owns seq and the timestamp (taken after the attempt). A failed sensor attempt
+     * comes back as a non-OK sample and is sent like any other; only a failed clock (or an
+     * internal error) gives no sample at all, and that ends the process. A LIVE backend never
+     * falls back to simulation. */
+    struct oc_sample s;
+    int io_errno = 0;
+    int arc = oc_reader_backend_acquire(r->be, &s, &io_errno);
+    if (arc != 0) {
+        fprintf(stderr, "openchair: reader %s: acquisition cannot continue (%d)\n", r->name, arc);
         r->fatal = true;
         r->stop = true;
         r->exit_code = OC_ROLE_EXIT_RUNTIME;
         return;
     }
-    struct oc_sample s = {.seq = r->next_seq, .source = r->source,
-                          .origin = OC_ORIGIN_SIMULATED, .status = rd.status,
-                          .value = rd.value, .aux = rd.aux};
-    s.t_mono_ns = now_or_zero(r);          /* after the "acquisition" */
-    if (r->stop)
-        return;
-    r->next_seq++;
     r->c.attempted++;
+    if (s.status != OC_ST_OK)
+        r->c.non_ok++;
 
     if (!r->conn.open) {
         r->c.unsent_disc++;
@@ -366,7 +374,7 @@ static int finish(struct reader *r)
         }
         oc_ipc_conn_close(&r->conn);
     }
-    char buf[400];
+    char buf[440];
     format_counters(r, false, buf, sizeof buf);
     int rc = oc_runlog_critical(&r->log, OC_READER_CRITICAL_MS, "SUMMARY %s exit=%d", buf,
                                 r->exit_code);
@@ -377,13 +385,15 @@ static int finish(struct reader *r)
     }
     if (r->sfd >= 0)
         close(r->sfd);
+    oc_reader_backend_close(r->be);           /* idempotent; releases the I2C descriptor */
     oc_runlog_restore(&r->log);
     return r->exit_code;
 }
 
-int oc_role_reader_run(const struct oc_role_opts *o)
+static int reader_run(const struct oc_role_opts *o, struct oc_reader_backend *injected)
 {
-    struct reader r = {.o = o, .sfd = -1};
+    struct oc_reader_backend own = {.i2c = {.fd = -1}};
+    struct reader r = {.o = o, .sfd = -1, .be = injected != nullptr ? injected : &own};
     r.name = o->role == OC_ROLE_LIGHT ? "light" : "distance";
     r.source = o->role == OC_ROLE_LIGHT ? OC_SOURCE_LIGHT : OC_SOURCE_DISTANCE;
     r.period_ns = (uint64_t)o->period_ms * MS_NS;
@@ -414,6 +424,18 @@ int oc_role_reader_run(const struct oc_role_opts *o)
         close(r.sfd);
         return OC_ROLE_EXIT_RUNTIME;
     }
+    /* Opened once; a bad input configuration (e.g. no such I2C device) is a configuration error
+     * and the process never connects or sends anything. Closed by finish(). */
+    rc = injected != nullptr ? 0 : oc_reader_backend_open(r.be, o, &r.clk);
+    if (rc != 0) {
+        fprintf(stderr, "openchair: reader %s: cannot open the %s input%s%s: %s\n", r.name,
+                o->input == OC_INPUT_LIVE ? "LIVE" : "SIMULATED",
+                o->input == OC_INPUT_LIVE ? " " : "", o->input == OC_INPUT_LIVE ? o->i2c_dev : "",
+                strerror(-rc));
+        close(r.sfd);
+        oc_runlog_restore(&r.log);
+        return OC_ROLE_EXIT_CONFIG;
+    }
     r.next_connect_ns = now;
     r.next_tick_ns = now + r.period_ns;
     r.next_stat_ns = now + (uint64_t)o->stat_ms * MS_NS;
@@ -423,4 +445,18 @@ int oc_role_reader_run(const struct oc_role_opts *o)
     if (r.fatal && r.exit_code == OC_ROLE_EXIT_OK)
         r.exit_code = OC_ROLE_EXIT_RUNTIME;
     return finish(&r);
+}
+
+int oc_role_reader_run(const struct oc_role_opts *o)
+{
+    return reader_run(o, nullptr);
+}
+
+int oc_role_reader_run_backend(const struct oc_role_opts *o, struct oc_reader_backend *be)
+{
+    if (o == nullptr || be == nullptr || be->kind == OC_READER_CLOSED)
+        return OC_ROLE_EXIT_CONFIG;
+    int rc = reader_run(o, be);
+    oc_reader_backend_close(be);              /* also covers the early returns before the loop */
+    return rc;
 }

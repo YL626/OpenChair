@@ -80,7 +80,7 @@ static void test_rejections(void)
     const char *const base_ok = "x";
     (void)base_ok;
 
-    /* readers must say --simulate; there is no LIVE mode */
+    /* readers must name an input mode (--input sim|live or --simulate) */
     PARSE(rc, o, "light", "--runtime-dir", "/tmp/x", "--session-id", "1", "--instance", "1");
     CHECK(rc == -EINVAL && err[0] != '\0');
     /* hub must acknowledge test-only authorization */
@@ -204,6 +204,99 @@ static void test_capture_options(void)
     CHECK(rc == -EINVAL);
 }
 
+static void test_input_modes(void)
+{
+    struct oc_role_opts o;
+    char err[128] = "";
+    int rc;
+
+    /* --simulate is an alias for --input sim */
+    PARSE(rc, o, "light", "--input", "sim", "--runtime-dir", "/tmp/x", "--session-id", "1",
+          "--instance", "1");
+    CHECK(rc == 0 && o.input == OC_INPUT_SIM && o.simulate && o.i2c_dev == nullptr);
+    PARSE(rc, o, "light", "--simulate", "--runtime-dir", "/tmp/x", "--session-id", "1",
+          "--instance", "1");
+    CHECK(rc == 0 && o.input == OC_INPUT_SIM && o.simulate);
+    PARSE(rc, o, "light", "--simulate", "--input", "sim", "--runtime-dir", "/tmp/x",
+          "--session-id", "1", "--instance", "1");           /* redundant, not conflicting */
+    CHECK(rc == 0 && o.input == OC_INPUT_SIM);
+
+    /* LIVE: default device, role defaults */
+    PARSE(rc, o, "light", "--input", "live", "--runtime-dir", "/tmp/x", "--session-id", "1",
+          "--instance", "1");
+    CHECK(rc == 0 && o.input == OC_INPUT_LIVE && !o.simulate);
+    CHECK(o.i2c_dev != nullptr && strcmp(o.i2c_dev, "/dev/i2c-1") == 0 && o.period_ms == 20);
+    PARSE(rc, o, "distance", "--input", "live", "--i2c-dev", "/dev/i2c-3", "--runtime-dir",
+          "/tmp/x", "--session-id", "1", "--instance", "1");
+    CHECK(rc == 0 && strcmp(o.i2c_dev, "/dev/i2c-3") == 0 && o.period_ms == 150);
+    PARSE(rc, o, "distance", "--input", "live", "--period-ms", "80", "--runtime-dir", "/tmp/x",
+          "--session-id", "1", "--instance", "1");           /* configurable */
+    CHECK(rc == 0 && o.period_ms == 80);
+    PARSE(rc, o, "distance", "--simulate", "--runtime-dir", "/tmp/x", "--session-id", "1",
+          "--instance", "1");
+    CHECK(rc == 0 && o.period_ms == 50);                     /* simulated default unchanged */
+
+    /* conflicts and missing mode */
+    PARSE(rc, o, "light", "--simulate", "--input", "live", "--runtime-dir", "/tmp/x",
+          "--session-id", "1", "--instance", "1");
+    CHECK(rc == -EINVAL && err[0] != '\0');
+    PARSE(rc, o, "light", "--input", "live", "--simulate", "--runtime-dir", "/tmp/x",
+          "--session-id", "1", "--instance", "1");
+    CHECK(rc == -EINVAL);
+    PARSE(rc, o, "light", "--input", "sim", "--input", "live", "--runtime-dir", "/tmp/x",
+          "--session-id", "1", "--instance", "1");           /* duplicate option */
+    CHECK(rc == -EINVAL);
+    PARSE(rc, o, "light", "--input", "bogus", "--runtime-dir", "/tmp/x", "--session-id", "1",
+          "--instance", "1");
+    CHECK(rc == -EINVAL);
+    PARSE(rc, o, "light", "--input", "LIVE", "--runtime-dir", "/tmp/x", "--session-id", "1",
+          "--instance", "1");
+    CHECK(rc == -EINVAL);
+    PARSE(rc, o, "light", "--input");
+    CHECK(rc == -EINVAL);
+
+    /* --i2c-dev: readers only, LIVE only, absolute */
+    PARSE(rc, o, "light", "--simulate", "--i2c-dev", "/dev/i2c-1", "--runtime-dir", "/tmp/x",
+          "--session-id", "1", "--instance", "1");
+    CHECK(rc == -EINVAL);
+    PARSE(rc, o, "light", "--input", "live", "--i2c-dev", "i2c-1", "--runtime-dir", "/tmp/x",
+          "--session-id", "1", "--instance", "1");
+    CHECK(rc == -EINVAL);
+    PARSE(rc, o, "hub", "--input", "live", "--i2c-dev", "/dev/i2c-1", "--unsupervised-test",
+          "--runtime-dir", "/tmp/x", "--session-id", "1");
+    CHECK(rc == -EINVAL);
+
+    /* fault injection stays simulated-only */
+    PARSE(rc, o, "light", "--input", "live", "--fault-every", "5", "--runtime-dir", "/tmp/x",
+          "--session-id", "1", "--instance", "1");
+    CHECK(rc == -EINVAL);
+    PARSE(rc, o, "light", "--input", "live", "--drop-conn-on-sigusr1", "--runtime-dir", "/tmp/x",
+          "--session-id", "1", "--instance", "1");
+    CHECK(rc == -EINVAL);
+    PARSE(rc, o, "hub", "--input", "live", "--unsupervised-test", "--runtime-dir", "/tmp/x",
+          "--session-id", "1", "--test-fd-headroom", "4");
+    CHECK(rc == -EINVAL);
+    PARSE(rc, o, "hub", "--input", "live", "--unsupervised-test", "--runtime-dir", "/tmp/x",
+          "--session-id", "1", "--capture-dir", "/tmp/c", "--test-fsize-limit", "100000");
+    CHECK(rc == -EINVAL);
+
+    /* LIVE controlled demonstrations keep --lifetime-ms and --unsupervised-test */
+    PARSE(rc, o, "hub", "--input", "live", "--unsupervised-test", "--runtime-dir", "/tmp/x",
+          "--session-id", "1", "--light-instance", "1", "--distance-instance", "2",
+          "--lifetime-ms", "60000", "--capture-dir", "/tmp/c", "--capture-ms", "60000");
+    CHECK(rc == 0 && o.input == OC_INPUT_LIVE && o.lifetime_ms == 60000 && o.unsupervised_test);
+    PARSE(rc, o, "hub", "--input", "live", "--runtime-dir", "/tmp/x", "--session-id", "1");
+    CHECK(rc == -EINVAL);                                    /* still needs --unsupervised-test */
+    PARSE(rc, o, "hub", "--runtime-dir", "/tmp/x", "--session-id", "1", "--unsupervised-test");
+    CHECK(rc == -EINVAL);                                    /* hub needs a mode too */
+
+    CHECK(oc_role_input_origin(OC_INPUT_LIVE) == 1 && oc_role_input_origin(OC_INPUT_SIM) == 2);
+    CHECK(oc_role_input_origin(OC_INPUT_NONE) == 0);
+    CHECK(strcmp(oc_role_origin_name(1), "LIVE") == 0);
+    CHECK(strcmp(oc_role_origin_name(2), "SIMULATED") == 0);
+    CHECK(strcmp(oc_role_origin_name(9), "?") == 0);
+}
+
 static void test_paths_overlap(void)
 {
     CHECK(oc_role_paths_overlap("/tmp/a", "/tmp/a"));
@@ -243,6 +336,7 @@ int main(void)
     test_socket_path_limits();
     test_capture_options();
     test_paths_overlap();
+    test_input_modes();
     if (failures != 0) {
         fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;

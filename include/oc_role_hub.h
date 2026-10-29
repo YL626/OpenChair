@@ -3,7 +3,8 @@
 
 /* oc_role_hub: the hub process (S3C).
  *
- * STATUS: S3C testing role. Reuses oc_hub_init / oc_hub_poll_setup /
+ * STATUS: S3C testing role; since M3-B the origin it authorizes, checks and labels
+ * (both sources, capture included) is the --input mode (sim -> SIMULATED, live -> LIVE). Reuses oc_hub_init / oc_hub_poll_setup /
  * oc_hub_dispatch / oc_hub_source_status / oc_hub_shutdown unchanged; there is
  * no new state machine here. The only logic added is the process loop
  * (signals, periodic reports, accept-error backoff) and the callbacks.

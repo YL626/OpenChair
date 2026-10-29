@@ -25,10 +25,12 @@
 struct src_acc {
     uint64_t cb_samples;        /* on_sample calls */
     uint64_t check_fail;        /* origin / timestamp sanity failures */
-    uint64_t origin_bad;        /* origin != SIMULATED */
+    uint64_t origin_bad;        /* origin != the session's input mode */
 };
 
 struct hub_run {
+    uint8_t origin;             /* enum oc_origin every sample must carry (from --input) */
+    const char *origin_name;
     struct oc_runlog log;
     struct src_acc acc[OC_SOURCE_DISTANCE + 1];
     uint64_t backoffs;          /* accept-error backoffs entered */
@@ -73,7 +75,7 @@ static void on_sample(void *ctx, const struct oc_hub_sample_info *i)
     struct src_acc *a = &h->acc[i->source];
     a->cb_samples++;
     bool bad = false;
-    if (i->origin != OC_ORIGIN_SIMULATED || i->sample->origin != OC_ORIGIN_SIMULATED) {
+    if (i->origin != h->origin || i->sample->origin != h->origin) {
         a->origin_bad++;
         bad = true;
     }
@@ -153,10 +155,10 @@ static void fmt_hub_stat(struct hub_run *h, const struct oc_hub *hub, const char
     oc_hub_stats(hub, &s);
     (void)oc_runlog_line(
         &h->log,
-        "%s role=hub origin=SIMULATED degraded=%d iter=%llu accept_errors=%llu backoffs=%llu "
+        "%s role=hub origin=%s degraded=%d iter=%llu accept_errors=%llu backoffs=%llu "
         "conns_accepted=%llu shed=%llu hello_timeouts=%llu datagrams=%llu malformed=%llu "
         "abusive_closes=%llu log_dropped=%llu",
-        tag, oc_hub_degraded(hub), (unsigned long long)h->iter, (unsigned long long)s.accept_errors,
+        tag, h->origin_name, oc_hub_degraded(hub), (unsigned long long)h->iter, (unsigned long long)s.accept_errors,
         (unsigned long long)h->backoffs, (unsigned long long)s.conns_accepted,
         (unsigned long long)s.shed, (unsigned long long)s.hello_timeouts,
         (unsigned long long)s.datagrams, (unsigned long long)s.malformed,
@@ -208,11 +210,11 @@ static void emit_capture_progress(struct hub_run *h)
     const struct oc_store_stream_status *t = &s.stream[OC_STREAM_TRACE];
     (void)oc_runlog_line(
         &h->log,
-        "CAPTURE state=%s flags=%s origin=SIMULATED have_seq=%d first_store_seq=%llu last_store_seq=%llu "
+        "CAPTURE state=%s flags=%s origin=%s have_seq=%d first_store_seq=%llu last_store_seq=%llu "
         "appended=%llu store=%s buffered=%llu written=%llu durable=%llu uncertain=%llu has_durable=%d "
         "durable_seq=%llu l_acc=%llu l_ok=%llu l_fail=%llu l_ns=%llu d_acc=%llu d_ok=%llu d_fail=%llu "
         "d_ns=%llu tick_fail=%llu",
-        cap_state_name(oc_capture_state(h->cap)), fl, r->have_store_seq,
+        cap_state_name(oc_capture_state(h->cap)), fl, h->origin_name, r->have_store_seq,
         (unsigned long long)r->first_store_seq, (unsigned long long)r->last_store_seq,
         (unsigned long long)r->records_appended, have ? (s.state == OC_STORE_OK ? "OK" : "FAILED") : "CLOSED",
         (unsigned long long)t->buffered, (unsigned long long)t->written, (unsigned long long)t->durable,
@@ -265,11 +267,11 @@ static void finish_and_report(struct hub_run *h)
     oc_capture_flags_str(r.flags, fl, sizeof fl);
     const struct oc_store_stream_status *t = &r.status.stream[OC_STREAM_TRACE];
     CRIT(h,
-         "CAPRESULT verdict=%s flags=%s origin=SIMULATED window_ms=%llu have_seq=%d first_store_seq=%llu "
+         "CAPRESULT verdict=%s flags=%s origin=%s window_ms=%llu have_seq=%d first_store_seq=%llu "
          "last_store_seq=%llu appended=%llu store_failed=%d store_errno=%d tick_fail=%llu sync_fail=%llu "
          "sync_rc=%d close_rc=%d reopen_rc=%d reopen_done=%d status_valid=%d store=%s buffered=%llu "
          "written=%llu durable=%llu uncertain=%llu durable_seq=%llu finish_ms=%llu",
-         r.verdict == OC_CAP_PASS ? "PASS" : "FAIL", fl, (unsigned long long)(r.window_ns / 1000000u),
+         r.verdict == OC_CAP_PASS ? "PASS" : "FAIL", fl, h->origin_name, (unsigned long long)(r.window_ns / 1000000u),
          r.have_store_seq, (unsigned long long)r.first_store_seq, (unsigned long long)r.last_store_seq,
          (unsigned long long)r.records_appended, r.store_failed, r.store_errno,
          (unsigned long long)r.tick_fail, (unsigned long long)r.sync_fail, r.sync_rc, r.close_rc,
@@ -308,7 +310,8 @@ static void finish_and_report(struct hub_run *h)
     lat_line(h, "tick", &r.lat_tick);
     lat_line(h, "sync", &r.lat_sync);
     if (r.verdict != OC_CAP_PASS)
-        fprintf(stderr, "openchair: hub: capture FAILED (%s); SIMULATED data, not M3 evidence either way\n", fl);
+        fprintf(stderr, "openchair: hub: capture FAILED (%s); %s data\n", fl,
+                h->origin == OC_ORIGIN_LIVE ? "LIVE" : "SIMULATED, not M3 evidence either way");
 }
 
 /* Once per failure: surface a storage failure the moment it is latched. */
@@ -320,8 +323,8 @@ static void note_store_failure(struct hub_run *h)
     h->store_fail_reported = true;
     char fl[160];
     oc_capture_flags_str(oc_capture_flags(h->cap), fl, sizeof fl);
-    CRIT(h, "STORE_FAIL origin=SIMULATED flags=%s errno=%d (sensing continues; nothing is retried or reported durable)",
-         fl, oc_capture_result(h->cap)->store_errno);
+    CRIT(h, "STORE_FAIL origin=%s flags=%s errno=%d (sensing continues; nothing is retried or reported durable)",
+         h->origin_name, fl, oc_capture_result(h->cap)->store_errno);
     fprintf(stderr, "openchair: hub: storage failed (%s); samples are no longer being stored\n", fl);
 }
 
@@ -484,6 +487,12 @@ static int hub_loop(struct hub_run *h, struct oc_hub *hub, const struct oc_role_
 int oc_role_hub_run(const struct oc_role_opts *o)
 {
     struct hub_run h = {0};
+    h.origin = oc_role_input_origin(o->input);
+    h.origin_name = oc_role_origin_name(h.origin);
+    if (h.origin == 0) {
+        fputs("openchair: hub: no input mode\n", stderr);
+        return OC_ROLE_EXIT_CONFIG;
+    }
     struct oc_clock clk;
     oc_clock_system(&clk);
     if (oc_runlog_init(&h.log, STDOUT_FILENO) != 0) {
@@ -511,8 +520,8 @@ int oc_role_hub_run(const struct oc_role_opts *o)
                              .on_sample = on_sample,
                              .on_event = on_event,
                              .ctx = &h};
-    cfg.origin[OC_SOURCE_LIGHT] = OC_ORIGIN_SIMULATED;
-    cfg.origin[OC_SOURCE_DISTANCE] = OC_ORIGIN_SIMULATED;
+    cfg.origin[OC_SOURCE_LIGHT] = h.origin;
+    cfg.origin[OC_SOURCE_DISTANCE] = h.origin;
     cfg.initial[OC_SOURCE_LIGHT].authorized = o->have_light_instance;
     cfg.initial[OC_SOURCE_LIGHT].instance = o->light_instance;
     cfg.initial[OC_SOURCE_DISTANCE].authorized = o->have_distance_instance;
@@ -536,7 +545,7 @@ int oc_role_hub_run(const struct oc_role_opts *o)
                                             .duration_ms = o->capture_ms,
                                             .arm_timeout_ms = o->capture_arm_timeout_ms,
                                             .fresh_ms = o->capture_fresh_ms,
-                                            .expected_origin = OC_ORIGIN_SIMULATED,
+                                            .expected_origin = h.origin,
                                             .trace_segment_bytes = o->capture_segment_bytes,
                                             .trace_segments = o->capture_trace_segments};
         struct oc_store_report srep;
@@ -590,10 +599,10 @@ int oc_role_hub_run(const struct oc_role_opts *o)
         if (o->have_distance_instance)
             snprintf(di, sizeof di, "%u", o->distance_instance);
         rc = oc_runlog_critical(&h.log, OC_HUB_ROLE_CRITICAL_MS,
-                                "READY role=hub origin=SIMULATED pid=%d socket=%s "
+                                "READY role=hub origin=%s pid=%d socket=%s "
                                 "authz=TEST-CONFIG-NOT-SUPERVISOR session=%llx light_inst=%s "
                                 "dist_inst=%s",
-                                (int)getpid(), path, (unsigned long long)o->session_id, li, di);
+                                h.origin_name, (int)getpid(), path, (unsigned long long)o->session_id, li, di);
         if (rc != 0) {
             fprintf(stderr, "openchair: hub: READY not delivered (%d)\n", rc);
             code = OC_ROLE_EXIT_RUNTIME;
@@ -623,7 +632,7 @@ int oc_role_hub_run(const struct oc_role_opts *o)
     fmt_hub_stat(&h, &hub, "FINAL");
     oc_hub_shutdown(&hub);
     rc = oc_runlog_critical(&h.log, OC_HUB_ROLE_CRITICAL_MS,
-                            "SUMMARY role=hub origin=SIMULATED exit=%d log_dropped=%llu", code,
+                            "SUMMARY role=hub origin=%s exit=%d log_dropped=%llu", h.origin_name, code,
                             (unsigned long long)h.log.dropped);
     if (rc != 0) {
         fprintf(stderr, "openchair: hub: SUMMARY not delivered (%d)\n", rc);

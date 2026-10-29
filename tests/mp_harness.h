@@ -344,7 +344,9 @@ static void alarm_handler(int sig)
     _exit(124);
 }
 
-static struct child *spawn(const char *name, char *const argv[])
+/* fn != NULL: the child runs fn(arg) in-process (after the same stdout pipe setup) instead of exec;
+ * used by test_multiproc_live to run a reader over a fake bus. */
+static struct child *spawn_impl(const char *name, char *const argv[], int (*fn)(void *), void *arg)
 {
     if (g_nch >= MAX_CHILD)
         return nullptr;
@@ -371,6 +373,8 @@ static struct child *spawn(const char *name, char *const argv[])
             _exit(127);
         if (dn > STDERR_FILENO)
             close(dn);
+        if (fn != nullptr)
+            _exit(fn(arg));
         execv(OPENCHAIR_BIN, argv);
         _exit(127);
     }
@@ -388,6 +392,11 @@ static struct child *spawn(const char *name, char *const argv[])
     g_pids[g_nch] = pid;
     g_nch++;
     return c;
+}
+
+static struct child *spawn(const char *name, char *const argv[])
+{
+    return spawn_impl(name, argv, nullptr, nullptr);
 }
 
 static void mark_reaped(struct child *c, int st)
@@ -467,6 +476,11 @@ static char *dup_str(const char *s)
     return d;
 }
 
+/* Input-mode arguments spawn_role passes (default "--simulate"). A suite that needs another mode
+ * (test_multiproc_live) sets these around its spawn calls. */
+static const char *g_input_a = "--simulate";
+static const char *g_input_b;
+
 /* extra: NULL-terminated list of additional arguments (literals). */
 static struct child *spawn_role(const char *name, const char *role, const char *const *fixed,
                                 const char *const *extra)
@@ -476,7 +490,9 @@ static struct child *spawn_role(const char *name, const char *role, const char *
     argv[n++] = dup_str("openchair");
     argv[n++] = dup_str("--role");
     argv[n++] = dup_str(role);
-    argv[n++] = dup_str("--simulate");
+    argv[n++] = dup_str(g_input_a);
+    if (g_input_b != nullptr)
+        argv[n++] = dup_str(g_input_b);
     argv[n++] = dup_str("--runtime-dir");
     argv[n++] = dup_str(g_dir);
     argv[n++] = dup_str("--session-id");
