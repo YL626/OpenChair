@@ -44,7 +44,7 @@ test: $(PLAIN)/test_smoke $(PLAIN)/test_sample $(PLAIN)/test_light $(PLAIN)/test
 		$(PLAIN)/test_ipc_msg $(PLAIN)/test_ipc $(PLAIN)/test_hub_seq $(PLAIN)/test_hub \
 		$(PLAIN)/test_backoff $(PLAIN)/test_role_args $(PLAIN)/test_multiproc \
 		$(PLAIN)/test_capture_fmt $(PLAIN)/test_capture $(PLAIN)/test_capture_faults \
-		$(PLAIN)/openchair test-store
+		$(PLAIN)/test_distance $(PLAIN)/distance_probe $(PLAIN)/openchair test-store
 	./$(PLAIN)/test_smoke
 	./$(PLAIN)/test_sample
 	./$(PLAIN)/test_light
@@ -59,12 +59,13 @@ test: $(PLAIN)/test_smoke $(PLAIN)/test_sample $(PLAIN)/test_light $(PLAIN)/test
 	./$(PLAIN)/test_capture_fmt
 	./$(PLAIN)/test_capture
 	./$(PLAIN)/test_capture_faults
+	./$(PLAIN)/test_distance
 
 asan: $(ASAN)/test_smoke $(ASAN)/test_sample $(ASAN)/test_light $(ASAN)/test_i2c_linux \
 		$(ASAN)/test_ipc_msg $(ASAN)/test_ipc $(ASAN)/test_hub_seq $(ASAN)/test_hub \
 		$(ASAN)/test_backoff $(ASAN)/test_role_args $(ASAN)/test_multiproc \
 		$(ASAN)/test_capture_fmt $(ASAN)/test_capture $(ASAN)/test_capture_faults \
-		$(ASAN)/openchair asan-store
+		$(ASAN)/test_distance $(ASAN)/openchair asan-store
 	ASAN_OPTIONS=detect_leaks=1:abort_on_error=0 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
 		./$(ASAN)/test_smoke
 	$(ASAN_ENV) ./$(ASAN)/test_sample
@@ -80,6 +81,7 @@ asan: $(ASAN)/test_smoke $(ASAN)/test_sample $(ASAN)/test_light $(ASAN)/test_i2c
 	$(ASAN_ENV) ./$(ASAN)/test_capture_fmt
 	$(ASAN_ENV) ./$(ASAN)/test_capture
 	$(ASAN_ENV) ./$(ASAN)/test_capture_faults
+	$(ASAN_ENV) ./$(ASAN)/test_distance
 
 
 
@@ -250,6 +252,27 @@ memcheck-m3a: $(PLAIN)/test_multiproc_capture $(PLAIN)/openchair
 		--trace-children=yes --child-silent-after-fork=no --log-file=$(BUILD)/valgrind-m3a-%p.log \
 		./$(PLAIN)/test_multiproc_capture
 	@echo "memcheck-m3a: no errors; logs in $(BUILD)/valgrind-m3a-*.log"
+
+# VL6180X distance reader tests (SIMULATED I2C only; no hardware).
+.PHONY: test-distance asan-distance memcheck-distance
+
+test-distance: $(PLAIN)/test_distance
+	./$<
+
+asan-distance: $(ASAN)/test_distance
+	$(ASAN_ENV) ./$<
+
+memcheck-distance: $(PLAIN)/test_distance
+	@command -v valgrind >/dev/null || { echo "memcheck-distance: valgrind not installed" >&2; exit 1; }
+	valgrind -q --error-exitcode=99 --leak-check=full --errors-for-leak-kinds=definite,possible ./$<
+
+# Live VL6180X probe (docs/vl6180x.md). Builds anywhere; reads hardware only
+# on a Pi: ./build/plain/distance_probe /dev/i2c-1 50 100
+.PHONY: probe
+probe: $(PLAIN)/distance_probe
+
+$(PLAIN)/distance_probe: tools/distance_probe.c $(PLAIN_LIB_OBJ) | $(PLAIN)
+	$(CC) $(CFLAGS_PLAIN) $< $(PLAIN_LIB_OBJ) -o $@
 
 run:
 	@echo "NOT AVAILABLE: no application exists yet (only a scaffold CLI)." >&2; exit 1
