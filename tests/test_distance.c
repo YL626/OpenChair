@@ -11,6 +11,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "oc_distance.h"
+#include "oc_sample.h"
 #include "oc_vl6180x.h"
 #include "fake_vl6180x.h"
 
@@ -324,6 +326,216 @@ static void test_range_clock_failure_stops_before_bus(void)
     CHECK(oc_vl6180x_setup(nullptr) == -EINVAL);
 }
 
+/* ---- adapter: oc_distance -> oc_sample ---- */
+
+struct drig {
+    struct fv f;
+    struct oc_i2c_bus bus;
+    struct oc_clock clk;
+    struct oc_distance dist;
+};
+
+static void drig_init(struct drig *r)
+{
+    fv_init(&r->f);
+    fv_bus(&r->f, &r->bus, &r->clk);
+    struct oc_vl6180x_cfg cfg = OC_VL6180X_CFG_DEFAULT;
+    CHECK(oc_distance_init(&r->dist, &r->bus, &r->clk, &cfg) == 0);
+}
+
+static void test_status_mapping(void)
+{
+    CHECK(oc_distance_status_for_errno(-ENXIO) == OC_ST_NACK);
+    CHECK(oc_distance_status_for_errno(-EREMOTEIO) == OC_ST_NACK);
+    CHECK(oc_distance_status_for_errno(-ETIMEDOUT) == OC_ST_TIMEOUT);
+    CHECK(oc_distance_status_for_errno(-EPROTO) == OC_ST_IO_ERR);
+    CHECK(oc_distance_status_for_errno(-EIO) == OC_ST_IO_ERR);
+    CHECK(oc_distance_status_for_errno(-EBUSY) == OC_ST_IO_ERR);
+}
+
+static void test_distance_init_validation(void)
+{
+    struct drig r;
+    drig_init(&r);
+    struct oc_vl6180x_cfg cfg = OC_VL6180X_CFG_DEFAULT;
+    CHECK(oc_distance_init(nullptr, &r.bus, &r.clk, &cfg) == -EINVAL);
+    CHECK(oc_distance_init(&r.dist, nullptr, &r.clk, &cfg) == -EINVAL);
+    cfg.addr = 0;
+    CHECK(oc_distance_init(&r.dist, &r.bus, &r.clk, &cfg) == -EINVAL);
+    struct oc_sample s;
+    CHECK(oc_distance_sample(nullptr, &s, nullptr) == -EINVAL);
+    CHECK(oc_distance_sample(&r.dist, nullptr, nullptr) == -EINVAL);
+    CHECK(r.f.calls == 0);
+}
+
+/* The first attempt sets the device up, then ranges: a valid OK sample. */
+static void test_distance_ok_sample(void)
+{
+    struct drig r;
+    drig_init(&r);
+    r.f.meas_polls = 5;
+    fv_push(&r.f, 87, 0);
+    uint64_t before = r.f.now;
+    struct oc_sample s;
+    int io = 99;
+    CHECK(oc_distance_sample(&r.dist, &s, &io) == 0);
+    CHECK(io == 0);
+    CHECK(s.status == OC_ST_OK && s.value == 87);
+    CHECK(s.source == OC_SOURCE_DISTANCE);
+    CHECK(s.origin == OC_ORIGIN_SIMULATED);
+    CHECK(s.seq == 0);
+    CHECK(s.aux == 0x01);                  /* raw range status: code 0, ready */
+    CHECK(s.t_mono_ns > before);           /* taken after the attempt */
+    CHECK(r.f.regs[0x0016] == 0x00);       /* setup ran on the first attempt */
+    CHECK(oc_sample_validate(&s) == 0);
+}
+
+/* A device-flagged invalid range is RANGE_ERR with value 0 and the raw
+ * status byte in aux; it is not a bus failure, so no re-setup follows. */
+static void test_distance_range_error(void)
+{
+    struct drig r;
+    drig_init(&r);
+    fv_push(&r.f, 255, 15);   /* range overflow: nothing in range */
+    fv_push(&r.f, 40, 0);
+    struct oc_sample s;
+    int io = 99;
+    CHECK(oc_distance_sample(&r.dist, &s, &io) == 0);
+    CHECK(io == 0);
+    CHECK(s.status == OC_ST_RANGE_ERR && s.value == 0);
+    CHECK(s.aux == (15u << 4 | 0x01u));
+    unsigned mark = r.f.calls;
+    CHECK(oc_distance_sample(&r.dist, &s, &io) == 0);
+    CHECK(s.status == OC_ST_OK && s.value == 40);
+    for (unsigned i = mark; i < r.f.calls; i++)   /* no setup: model ID not re-read */
+        CHECK(!(r.f.log[i].read && r.f.log[i].reg == 0x0000));
+}
+
+/* Bus failures map to statuses with value 0 and aux 0; the errno comes back
+ * through io_errno. */
+static void test_distance_failures_map_and_zero_value(void)
+{
+    struct { bool unplug; bool stuck; uint8_t model; int want_io; uint8_t want_st; } c[] = {
+        {true, false, 0xB4, -ENXIO, OC_ST_NACK},
+        {false, true, 0xB4, -ETIMEDOUT, OC_ST_TIMEOUT},
+        {false, false, 0xAA, -EPROTO, OC_ST_IO_ERR},
+    };
+    for (size_t i = 0; i < sizeof c / sizeof c[0]; i++) {
+        struct drig r;
+        drig_init(&r);
+        r.f.unplugged = c[i].unplug;
+        r.f.stuck = c[i].stuck;
+        r.f.regs[0x0000] = c[i].model;
+        fv_push(&r.f, 99, 0);
+        struct oc_sample s;
+        int io = 0;
+        CHECK(oc_distance_sample(&r.dist, &s, &io) == 0);
+        CHECK(io == c[i].want_io);
+        CHECK(s.status == c[i].want_st);
+        CHECK(s.value == 0 && s.aux == 0);
+        CHECK(oc_sample_validate(&s) == 0);
+    }
+}
+
+static void test_distance_seq_counts_attempts(void)
+{
+    struct drig r;
+    drig_init(&r);
+    struct oc_sample s;
+    CHECK(oc_distance_sample(&r.dist, &s, nullptr) == 0 && s.seq == 0);
+    r.f.unplugged = true;
+    CHECK(oc_distance_sample(&r.dist, &s, nullptr) == 0 && s.seq == 1);
+    CHECK(s.status == OC_ST_NACK);
+    r.f.unplugged = false;
+    CHECK(oc_distance_sample(&r.dist, &s, nullptr) == 0 && s.seq == 2);
+
+    r.dist.seq = UINT32_MAX;   /* wraps like the light reader */
+    CHECK(oc_distance_sample(&r.dist, &s, nullptr) == 0 && s.seq == UINT32_MAX);
+    CHECK(oc_distance_sample(&r.dist, &s, nullptr) == 0 && s.seq == 0);
+}
+
+/* Unplugging the sensor gives NACK samples; when it comes back power-cycled
+ * (settings lost, fresh out of reset) the next attempt sets it up again and
+ * readings resume, with no restart of the reader. */
+static void test_distance_unplug_and_replug_recovers(void)
+{
+    struct drig r;
+    drig_init(&r);
+    fv_push(&r.f, 10, 0);
+    fv_push(&r.f, 20, 0);
+    struct oc_sample s;
+    CHECK(oc_distance_sample(&r.dist, &s, nullptr) == 0 && s.status == OC_ST_OK);
+    CHECK(r.f.private_writes == 30);
+
+    r.f.unplugged = true;
+    for (int i = 0; i < 3; i++) {
+        CHECK(oc_distance_sample(&r.dist, &s, nullptr) == 0);
+        CHECK(s.status == OC_ST_NACK && s.value == 0);
+    }
+
+    r.f.unplugged = false;
+    fv_power_on(&r.f);   /* re-plugged: power-cycled, settings gone */
+    CHECK(oc_distance_sample(&r.dist, &s, nullptr) == 0);
+    CHECK(s.status == OC_ST_OK && s.value == 20);
+    CHECK(r.f.private_writes == 60);    /* mandatory settings reloaded */
+    CHECK(r.f.regs[0x0016] == 0x00);
+    CHECK(r.f.regs[0x0014] == 0x24);
+}
+
+static void test_distance_origin_fixed_at_init(void)
+{
+    struct drig r;
+    fv_init(&r.f);
+    fv_bus(&r.f, &r.bus, &r.clk);
+    r.bus.origin = OC_ORIGIN_REPLAYED;
+    struct oc_vl6180x_cfg cfg = OC_VL6180X_CFG_DEFAULT;
+    CHECK(oc_distance_init(&r.dist, &r.bus, &r.clk, &cfg) == 0);
+    r.bus.origin = OC_ORIGIN_LIVE;   /* later edits to the caller's bus do not reach samples */
+    struct oc_sample s;
+    CHECK(oc_distance_sample(&r.dist, &s, nullptr) == 0);
+    CHECK(s.origin == OC_ORIGIN_REPLAYED);
+}
+
+/* A failed clock read means no timestamp: no sample is produced, the attempt's
+ * errno is still reported, and seq is consumed. */
+static void test_distance_clock_failure_is_not_fabricated(void)
+{
+    struct drig r;
+    drig_init(&r);
+    r.f.unplugged = true;
+    struct oc_sample s, before;
+    memset(&s, 0x5A, sizeof s);
+    before = s;
+    r.f.now_fail_from = 1;
+    r.f.now_errno = EINVAL;
+    int io = 0;
+    /* setup's NACK happens before any clock use; the timestamp read fails */
+    CHECK(oc_distance_sample(&r.dist, &s, &io) == -EINVAL);
+    CHECK(io == -ENXIO);
+    CHECK(memcmp(&s, &before, sizeof s) == 0);
+    CHECK(r.dist.seq == 1);
+}
+
+static void test_distance_samples_survive_the_wire(void)
+{
+    struct drig r;
+    drig_init(&r);
+    fv_push(&r.f, 200, 0);
+    fv_push(&r.f, 0, 11);
+    for (int i = 0; i < 2; i++) {
+        struct oc_sample s, back;
+        CHECK(oc_distance_sample(&r.dist, &s, nullptr) == 0);
+        uint8_t wire[OC_MSG_SAMPLE_SIZE];
+        size_t n = 0;
+        CHECK(oc_msg_sample_encode(&s, wire, sizeof wire, &n) == 0 && n == OC_MSG_SAMPLE_SIZE);
+        CHECK(oc_msg_sample_decode(wire, n, &back) == 0);
+        /* field by field: memcmp would also compare uninitialised padding */
+        CHECK(s.t_mono_ns == back.t_mono_ns && s.seq == back.seq &&
+              s.source == back.source && s.origin == back.origin &&
+              s.status == back.status && s.value == back.value && s.aux == back.aux);
+    }
+}
+
 int main(void)
 {
     RUN(test_init_validates_before_hardware);
@@ -342,6 +554,16 @@ int main(void)
     RUN(test_timeout_terminates_with_frozen_clock);
     RUN(test_range_bus_errors_pass_through_each_step);
     RUN(test_range_clock_failure_stops_before_bus);
+    RUN(test_status_mapping);
+    RUN(test_distance_init_validation);
+    RUN(test_distance_ok_sample);
+    RUN(test_distance_range_error);
+    RUN(test_distance_failures_map_and_zero_value);
+    RUN(test_distance_seq_counts_attempts);
+    RUN(test_distance_unplug_and_replug_recovers);
+    RUN(test_distance_origin_fixed_at_init);
+    RUN(test_distance_clock_failure_is_not_fabricated);
+    RUN(test_distance_samples_survive_the_wire);
 
     if (failures != 0) {
         fprintf(stderr, "test_distance: %d check(s) failed\n", failures);
