@@ -309,3 +309,78 @@ Six commits on `kacperm37-impl`. Each was verified with `make test-store`, `make
 - **Software-only, synthetic input.** Nothing has been verified on the Pi, the SD card, ext4, or a real power cut.
 - Waiting on Alan's review: the decisions table in `docs/oc_store.md` §6, especially the `-EDQUOT` evidence cap (which needs a DESIGN.md line) and the cost of a rollover inside `append`.
 - Not done: integration into the hub (after the interface review), and copying this session's transcript into `kacperm37/transcripts/`.
+
+---
+
+## Session 2026-10-28 (continued): PR #29 review and the VL6180X distance reader
+
+- **Raw transcript:** the same session file as above (`2da26bb8-6eeb-44d0-8c19-5184218c9f3e.jsonl`).
+- **Branch:** `kacperm37-vl6180x` (created by Claude from `main` after PR #29 merged).
+
+### Episode 4: ELI15 of Alan's PR #29 notes change
+
+**Prompt:**
+
+> Look through this github PR and please ELI15 what's important for me to know/approve in IMPLEMENTATION_NOTES.md: https://github.com/YL626/OpenChair/pull/29/changes#diff-b69c9494aef3d5a229ad7c442ac031f94d1869764ed6a18b216eb2645b70847b
+
+**What Claude did:**
+
+- `gh` isn't installed, so it fetched `refs/pull/29/head` read-only with git and diffed against the PR's parent.
+- The only change to the notes is a new `oc_sample` status, **7 = IO_ERR** ("the read failed, but not a NACK or a timeout"). The protocol version stays at 1.
+- It explained the status byte as the box a delivery driver ticks.
+- **The catch:** a build that doesn't know status 7 rejects it as malformed. That's harmless while all four processes come from one build, but it means bumping the version before the soak.
+- **What it means for me:**
+  - the distance reader should use the same errno→status table;
+  - `oc_store` is unaffected;
+  - `oc_sample.h` reuses `enum oc_origin` from my `oc_store.h`, so those numbers must never change;
+  - a Makefile merge conflict was coming.
+- It drafted a plan file; I rejected it with "change nothing, I'll do it from git GUI", so it gave the explanation in chat only.
+
+### My thoughts:
+<!-- Kacper: your thoughts here. -->
+
+---
+
+### Episode 5: Implementing the VL6180X distance reader (M3)
+
+**Prompt** (pasted task, then my request):
+
+> *[Pasted: "M3 — Implement C23 VL6180X Distance Reader. Ownership: Kacper…", with Scope and dependencies, and Workflow.]*
+>
+> Please read the spec in Documents/OpenChairExtra/CS370-TermProject.pdf. I need to implement the bare minimum to read live input from the VL6180X distance reader
+
+**What Claude did:**
+
+- Read Alan's merged code: `oc_i2c` (the Linux `I2C_RDWR` transport, which labels its bus LIVE), `oc_clock`, `oc_ads1115`, `oc_light` and the ADS1115 fake. It also read the spec's M3 row ("both sensors flowing through the real pipeline into real storage") and §10.2 ("close the loop with measurements").
+- Proposed mirroring Alan's light reader and asked two questions. **My answers:** a separate probe tool binary, and a new branch with about 4 commits.
+- **`ca5dd3d` Driver** (`oc_vl6180x`):
+  - checks the model ID (0xB4) and writes **nothing** to a device that isn't a VL6180X;
+  - loads ST AN4545's mandatory settings only when the chip is fresh out of reset;
+  - single-shot range, clearing the interrupt *before* each start, so a stale result can't be returned;
+  - a 100 ms deadline [MEASURE] plus a poll cap, so a frozen clock still terminates.
+
+  There are 16 tests against a new simulated register model, `tests/fake_vl6180x.h`; Alan's fake is untouched. Claude stated that the register facts come from the datasheet/AN4545 as it remembers them, marked them [REVIEW], and said they are not yet checked against the datasheet.
+- **`5c90583` Adapter** (`oc_distance`):
+  - follows the `oc_light` pattern: seq per attempt, timestamp after the attempt, origin from the bus;
+  - status mapping: range error → RANGE_ERR, NACK/TIMEOUT/IO_ERR the same as light;
+  - re-runs setup after any failure, so an unplugged and re-plugged sensor recovers without a restart.
+
+  There are 10 more tests.
+- **Mutation checks**, as for the store. Every driver mutation was caught; the missing poll cap shows up as a hung test. One adapter mutation survived, but it was equivalent (the value is 0 either way).
+- **A slip, then a fix.** Claude chained the adapter's Valgrind run and the commit in one command, so the commit went through even though Valgrind exited 99. The cause was the wire round-trip test's `memcmp` on `struct oc_sample`, which compares uninitialised padding. That was a bug in the test, not the product. Claude fixed it to compare field by field (as Alan's test does), re-ran Valgrind (clean), and amended the unpushed commit.
+- **`1a432c9` Probe and docs.**
+  - `tools/distance_probe.c` (`make probe`) prints CSV samples through the real driver and adapter.
+  - `docs/vl6180x.md` covers the mapping, decisions for Alan, and the Pi bring-up procedure.
+  - **Unplanned live run.** This laptop has its own `/dev/i2c-1`, so the probe's default device was a real bus. Every attempt got a real kernel NACK (`ENXIO`, about 5.5 ms each), and the model-ID gate meant nothing was written. The docs and commit say these are live *attempts*, not distance readings.
+
+### My thoughts:
+<!-- Kacper: your thoughts here. -->
+
+---
+
+### State at the end of this episode
+
+- `make clean && make && make test && make asan && make memcheck` and `make memcheck-distance`: all pass. `test_distance` has 26 tests (SIMULATED).
+- **No VL6180X reading exists yet.** Next is running `docs/vl6180x.md` §4 on the Pi (i2cdetect, three probe runs, dmesg) and committing the raw output.
+- **For Alan's review:** `aux` = the raw range-status byte; the errno table is duplicated from `oc_light`; re-setup after a failure.
+- **Not started:** the distance reader *process* (HELLO, IPC, heartbeats). It depends on Mechanism E.
