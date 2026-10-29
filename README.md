@@ -4,7 +4,7 @@ OpenChair is a handheld Raspberry Pi-based diagnostic reader for powered wheelch
 
 The software will decode supported, verified controller-specific patterns and show an understandable explanation. Unknown or unreliable readings must not produce an invented diagnosis; the device will instead offer retry or manual code entry. The product is designed to operate fully offline.
 
-> **Status: early development.** No sensor support, diagnostic logic, or real application exists yet. The repository contains project documentation, a working native Linux/WSL2 C23 build and test system, and a minimal scaffold CLI with smoke tests that exist only to exercise that toolchain.
+> **Status: early development.** No sensor support, diagnostic logic, supervisor or real application exists yet. The repository contains project documentation, a working native Linux/WSL2 C23 build and test system, host-tested IPC/hub/reader modules, and a CLI whose `--role` testing processes run a SIMULATED three-process demonstration (see below). Nothing has been run on the Raspberry Pi or with live sensors.
 
 ## Target hardware
 
@@ -74,9 +74,30 @@ The build is native to Linux/WSL2 (GCC, GNU Make). There is no cross-compilation
 | `make test-store` | Builds and runs the `oc_store` storage tests (`tests/test_store*.c`). **Expected to fail** until the storage library is implemented (it is currently a stub); see `docs/oc_store_tests.md`. |
 | `make asan-store` | The same storage tests under ASan/UBSan. Also expected to fail until implemented. |
 | `make memcheck-store` | The same storage tests under Valgrind. It reports Valgrind errors separately from test failures. |
+| `make test-multiproc` / `asan-multiproc` / `memcheck-multiproc` | S3C **core** multiprocess suite alone (real hub + two reader processes, SIMULATED samples): plain, under ASan/UBSan, and under Valgrind with every exec'd child traced (`build/valgrind-mp-*.log`). The core suite is also part of `make test` and `make asan`. |
+| `make test-stress` / `make asan-stress` | S3C **stress/negative** scenarios, kept out of `make test`: real descriptor exhaustion in the hub (T8) and same-instance respawn with a reset sequence (T7). |
+| `make test-roles` / `asan-roles` | Unit tests of the pure S3C modules (backoff, simulated source, option parsing). |
 | `make clean` | Removes `build/`. |
 | `make run`, `make soakcheck` | **Not available.** Print a message and exit nonzero; no application or soak test exists. |
 | `make deploy` | Does not exist. |
+
+### S3C role processes (SIMULATED only)
+
+`openchair --version` and `--help` are unchanged. The same executable can also run as one of three cooperating processes. Everything these roles produce is **SIMULATED**: there is no hardware, no LIVE mode, no supervisor and no storage. They exist to exercise the IPC transport and the hub state machine across real Linux processes.
+
+```
+openchair --role hub --simulate --unsupervised-test --runtime-dir DIR --session-id HEX
+          [--light-instance N] [--distance-instance N] [--stat-ms N] [--lifetime-ms N]
+openchair --role light|distance --simulate --runtime-dir DIR --session-id HEX --instance N
+          [--period-ms N] [--stat-ms N] [--lifetime-ms N]
+openchair --role help        # full option list, including the testing controls
+```
+
+- `DIR` is a caller-created directory (mode 0700, owned by you); the hub listens on `DIR/hub.sock`.
+- **The hub's session id and authorized instances are explicit command-line test configuration** (`--unsupervised-test`). This is not supervisor authorization; no authorization message crosses a process boundary in S3C. The supervisor (S4) will draw the session id and allocate a fresh instance per spawned reader.
+- Testing controls, available only with `--simulate` / `--unsupervised-test`: `--fault-every N` (every Nth attempt is a TIMEOUT), `--drop-conn-on-sigusr1` (SIGUSR1 makes a reader drop its socket and reconnect in the same process, keeping instance and sequence), `--hello-timeout-ms`, `--test-fd-headroom N` (hub lowers `RLIMIT_NOFILE` after start-up so only N more descriptors can be opened).
+- Each process prints `key=value` lines on stdout: `READY`, `STAT`/`SRC`, `EVENT`, `SUMMARY`. `READY` and `SUMMARY` are delivered with a bounded retry and a failure to deliver them makes the process exit 4; routine lines are dropped (and counted) rather than queued if the reader of the pipe is slow. A process killed with SIGKILL writes no `SUMMARY`.
+- Exit codes: 0 clean, 2 usage, 3 configuration or permanent HELLO rejection, 4 runtime failure.
 
 Plain and sanitizer builds use separate object trees and are never mixed; Valgrind runs only on the plain build because it is incompatible with ASan.
 

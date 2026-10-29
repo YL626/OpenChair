@@ -27,16 +27,22 @@ STORE_TESTS := test_store test_store_faults test_store_kill
 # Fault-injection seam: the faults binary routes oc_store's write/sync calls
 # through __wrap_* functions in tests/test_store_faults.c.
 STORE_WRAP := -Wl,--wrap=write,--wrap=pwrite,--wrap=writev,--wrap=pwritev,--wrap=fsync,--wrap=fdatasync
+# Deadline multipliers for the multiprocess suites (loose waits, never tight assertions).
+ASAN_SCALE := 3
+VALGRIND_SCALE := 8
 ASAN_ENV := ASAN_OPTIONS=detect_leaks=1:abort_on_error=0 \
 	UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1
 
-.PHONY: all test asan memcheck run soakcheck clean test-store asan-store memcheck-store
+.PHONY: all test asan memcheck run soakcheck clean test-store asan-store memcheck-store \
+	test-roles asan-roles test-multiproc asan-multiproc memcheck-multiproc \
+	test-stress asan-stress
 .DEFAULT_GOAL := all
 
 all: $(PLAIN)/openchair
 
 test: $(PLAIN)/test_smoke $(PLAIN)/test_sample $(PLAIN)/test_light $(PLAIN)/test_i2c_linux \
 		$(PLAIN)/test_ipc_msg $(PLAIN)/test_ipc $(PLAIN)/test_hub_seq $(PLAIN)/test_hub \
+		$(PLAIN)/test_backoff $(PLAIN)/test_role_args $(PLAIN)/test_multiproc \
 		$(PLAIN)/openchair
 	./$(PLAIN)/test_smoke
 	./$(PLAIN)/test_sample
@@ -46,9 +52,13 @@ test: $(PLAIN)/test_smoke $(PLAIN)/test_sample $(PLAIN)/test_light $(PLAIN)/test
 	./$(PLAIN)/test_ipc
 	./$(PLAIN)/test_hub_seq
 	./$(PLAIN)/test_hub
+	./$(PLAIN)/test_backoff
+	./$(PLAIN)/test_role_args
+	./$(PLAIN)/test_multiproc
 
 asan: $(ASAN)/test_smoke $(ASAN)/test_sample $(ASAN)/test_light $(ASAN)/test_i2c_linux \
 		$(ASAN)/test_ipc_msg $(ASAN)/test_ipc $(ASAN)/test_hub_seq $(ASAN)/test_hub \
+		$(ASAN)/test_backoff $(ASAN)/test_role_args $(ASAN)/test_multiproc \
 		$(ASAN)/openchair
 	ASAN_OPTIONS=detect_leaks=1:abort_on_error=0 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
 		./$(ASAN)/test_smoke
@@ -59,6 +69,9 @@ asan: $(ASAN)/test_smoke $(ASAN)/test_sample $(ASAN)/test_light $(ASAN)/test_i2c
 	$(ASAN_ENV) ./$(ASAN)/test_ipc
 	$(ASAN_ENV) ./$(ASAN)/test_hub_seq
 	$(ASAN_ENV) ./$(ASAN)/test_hub
+	$(ASAN_ENV) ./$(ASAN)/test_backoff
+	$(ASAN_ENV) ./$(ASAN)/test_role_args
+	$(ASAN_ENV) OC_TEST_TIME_SCALE=$(ASAN_SCALE) ./$(ASAN)/test_multiproc
 
 memcheck: $(PLAIN)/test_smoke $(PLAIN)/openchair
 	@command -v valgrind >/dev/null || { echo "memcheck: valgrind not installed" >&2; exit 1; }
@@ -151,6 +164,47 @@ memcheck-hub: $(addprefix $(PLAIN)/,$(HUB_TESTS))
 	@rc=0; for t in $^; do valgrind -q --error-exitcode=99 --leak-check=full \
 		--errors-for-leak-kinds=definite,possible ./$$t || rc=1; done; exit $$rc
 
+# S3C role units (backoff, simulated source, option parsing) and the multiprocess
+# suites. Every sample is SIMULATED. The CORE suite is part of `make test` / `make asan`;
+# the STRESS suite (descriptor exhaustion, same-instance respawn) is separate and
+# heavier. timeout(1) is the outer hard limit on top of the suites' own deadlines.
+ROLE_TESTS := test_backoff test_role_args
+MP_TIMEOUT := 300
+
+test-roles: $(addprefix $(PLAIN)/,$(ROLE_TESTS))
+	@rc=0; for t in $^; do ./$$t || rc=1; done; exit $$rc
+
+asan-roles: $(addprefix $(ASAN)/,$(ROLE_TESTS))
+	@rc=0; for t in $^; do $(ASAN_ENV) ./$$t || rc=1; done; exit $$rc
+
+test-multiproc: $(PLAIN)/test_multiproc
+	timeout $(MP_TIMEOUT) ./$<
+
+asan-multiproc: $(ASAN)/test_multiproc
+	$(ASAN_ENV) OC_TEST_TIME_SCALE=$(ASAN_SCALE) timeout $(MP_TIMEOUT) ./$<
+
+test-stress: $(PLAIN)/test_multiproc_stress
+	timeout $(MP_TIMEOUT) ./$<
+
+asan-stress: $(ASAN)/test_multiproc_stress
+	$(ASAN_ENV) OC_TEST_TIME_SCALE=$(ASAN_SCALE) timeout $(MP_TIMEOUT) ./$<
+
+# Valgrind: role units, then the core multiprocess suite with every exec'd child
+# traced (per-pid logs in build/valgrind-mp-*.log). Instrumentation-sensitive
+# assertions (CPU time, exact descriptor counts) are skipped via
+# OC_TEST_UNDER_VALGRIND; deadlines are scaled by VALGRIND_SCALE.
+memcheck-multiproc: $(addprefix $(PLAIN)/,$(ROLE_TESTS)) $(PLAIN)/test_multiproc $(PLAIN)/openchair
+	@command -v valgrind >/dev/null || { echo "memcheck-multiproc: valgrind not installed" >&2; exit 1; }
+	@rc=0; for t in $(addprefix $(PLAIN)/,$(ROLE_TESTS)); do valgrind -q --error-exitcode=99 \
+		--leak-check=full --errors-for-leak-kinds=definite,possible ./$$t || rc=1; done; \
+	[ $$rc -eq 0 ] || exit $$rc
+	rm -f $(BUILD)/valgrind-mp-*.log
+	OC_TEST_UNDER_VALGRIND=1 OC_TEST_TIME_SCALE=$(VALGRIND_SCALE) timeout $$(( $(MP_TIMEOUT) * 4 )) \
+		valgrind --error-exitcode=99 --leak-check=full --errors-for-leak-kinds=definite,possible \
+		--trace-children=yes --child-silent-after-fork=no --log-file=$(BUILD)/valgrind-mp-%p.log \
+		./$(PLAIN)/test_multiproc
+	@echo "memcheck-multiproc: no errors; logs in $(BUILD)/valgrind-mp-*.log"
+
 run:
 	@echo "NOT AVAILABLE: no application exists yet (only a scaffold CLI)." >&2; exit 1
 
@@ -167,6 +221,11 @@ $(PLAIN)/%.o: $(SRC)/%.c | $(PLAIN)
 $(PLAIN)/openchair: $(PLAIN)/main.o $(PLAIN_LIB_OBJ)
 	$(CC) $^ -o $@
 
+# S3C multiprocess suites exec the real openchair binary (OPENCHAIR_BIN) and
+# are given the openchair target as a prerequisite so it is always current.
+$(PLAIN)/test_multiproc $(PLAIN)/test_multiproc_stress: $(PLAIN)/test_%: $(TEST)/test_%.c $(TEST)/mp_harness.h $(PLAIN)/openchair $(PLAIN_LIB_OBJ) | $(PLAIN)
+	$(CC) $(CFLAGS_PLAIN) -DOPENCHAIR_BIN='"./$(PLAIN)/openchair"' $< $(PLAIN_LIB_OBJ) -o $@
+
 $(PLAIN)/test_smoke: $(TEST)/test_smoke.c $(PLAIN_LIB_OBJ) | $(PLAIN)
 	$(CC) $(CFLAGS_PLAIN) -DOPENCHAIR_BIN='"./$(PLAIN)/openchair"' $< $(PLAIN_LIB_OBJ) -o $@
 
@@ -178,6 +237,9 @@ $(ASAN)/openchair: $(ASAN)/main.o $(ASAN_LIB_OBJ)
 	$(CC) $(LDFLAGS_ASAN) $^ -o $@
 
 $(ASAN)/test_smoke: $(TEST)/test_smoke.c $(ASAN_LIB_OBJ) | $(ASAN)
+	$(CC) $(CFLAGS_ASAN) $(LDFLAGS_ASAN) -DOPENCHAIR_BIN='"./$(ASAN)/openchair"' $< $(ASAN_LIB_OBJ) -o $@
+
+$(ASAN)/test_multiproc $(ASAN)/test_multiproc_stress: $(ASAN)/test_%: $(TEST)/test_%.c $(TEST)/mp_harness.h $(ASAN)/openchair $(ASAN_LIB_OBJ) | $(ASAN)
 	$(CC) $(CFLAGS_ASAN) $(LDFLAGS_ASAN) -DOPENCHAIR_BIN='"./$(ASAN)/openchair"' $< $(ASAN_LIB_OBJ) -o $@
 
 # --- oc_store test binaries (LDWRAP is set per target for fault injection) ---

@@ -1,6 +1,6 @@
 # OpenChair Implementation Notes
 
-Supplement to `DESIGN.md`. `DESIGN.md` is authoritative; if the two disagree, `DESIGN.md` wins and this file is corrected. These notes hold low-level detail removed from the design document. Everything here is **[REVIEW]**: the architecture is team-agreed, but byte-level and API-level details await technical review by the owning and consuming partner. **Implementation status.** Host-tested on Linux with SIMULATED inputs: the sample codec (S1), the ADS1115 light reader (S2, against a fake I2C bus), the IPC control codec and transport (S3A), and the hub receiver and per-source state machine (S3B). Not implemented: the VL6180X reader, the supervisor and control channel, storage integration, the optical analysis, the UI, and the assembled application. Nothing here has been measured or verified on the Raspberry Pi hardware; passing host tests shows logic only. **[MEASURE]** marks values that need hardware data.
+Supplement to `DESIGN.md`. `DESIGN.md` is authoritative; if the two disagree, `DESIGN.md` wins and this file is corrected. These notes hold low-level detail removed from the design document. Everything here is **[REVIEW]**: the architecture is team-agreed, but byte-level and API-level details await technical review by the owning and consuming partner. **Implementation status.** Host-tested on Linux with SIMULATED inputs: the sample codec (S1), the ADS1115 light reader (S2, against a fake I2C bus), the IPC control codec and transport (S3A), and the hub receiver and per-source state machine (S3B), and a three-process SIMULATED run of hub plus two reader roles over real sockets (S3C, section 9a). Not implemented: the VL6180X reader, the supervisor and control channel, storage integration, the optical analysis, the UI, and the assembled application. Nothing here has been measured or verified on the Raspberry Pi hardware; passing host tests shows logic only. **[MEASURE]** marks values that need hardware data.
 
 ## 1. oc_sample wire format
 
@@ -124,6 +124,32 @@ Single-writer, not thread-safe, used by the hub only. Data states: *buffered* (p
 3. Read back through `read`. For each source check: stored count equals received count; all `seq` gaps are accounted for by drop counters; timestamps are non-decreasing; origin is LIVE.
 4. `kill -9` the hub, restart it, confirm `STORE_RECOVER` is reported and repeat the read-back check.
 5. Copy the raw files off with a checksum; never edit them. SIMULATED or REPLAYED runs may exercise the path but are labeled as such and cannot satisfy M3.
+
+## 9a. S3C: multiprocess SIMULATED integration
+
+**Scope.** Three real Linux processes (`openchair --role hub|light|distance`) over the S3A transport into the S3B hub. All samples are SIMULATED (deterministic synthetic values from `oc_sim_source`; origin SIMULATED). Not covered, by design: supervisor, fd-3 control channel and authorization messages, automatic restart, heartbeats, hardware, storage, fusion, analysis. The hub's session id and authorized instances are command-line *test configuration* (`--unsupervised-test`), never supervisor authorization.
+
+**Reader counters** (process lifetime; a reconnect never resets them or the sequence): `attempted` equals `sent + unsent_disc + bp_drop + send_fail`, every attempt having exactly one outcome (`unsent_disc`: no open connection, so not handed to the IPC layer; `bp_drop`: `-EAGAIN`; `send_fail`: any other error). `overruns` are ticks that were due but not attempted because the loop was late; they consume no seq and are never counted as samples or drops.
+
+**Reconnect.** 100 ms doubling to 2 s, reset only after a connection stayed up for 1 s (so a hub that ACKs and then cuts a reader off cannot pin it at 100 ms). Permanent HELLO rejects (MALFORMED, BAD_SOURCE, BAD_ORIGIN, SESSION_MISMATCH, PEER_CRED) end the reader with exit 3; NOT_READY, STALE_INSTANCE and DUPLICATE_SOURCE are retried.
+
+**Interruptibility.** One `poll()` waits on a signalfd (signals blocked before it is created), the connection, and the nearest deadline. Shutdown works in every state, including reconnect backoff. **Exception:** `oc_ipc_client_handshake` cannot be interrupted, so a shutdown request arriving during a handshake waits up to `OC_READER_HANDSHAKE_MS` (250 ms); sampling is likewise paused for at most that long, after which late ticks are counted as `overruns`.
+
+**Hub accept errors.** `oc_hub_dispatch` accepts only when the listener's `revents` is set, and a failing accept (EMFILE) leaves the connection in the kernel backlog, so poll would report the listener forever. The runner therefore sets the listener's pollfd to -1 for 50 ms doubling to 1 s after `stats.accept_errors` grows, while established connections and the signalfd are still served; the delay resets after a successful accept. No change to `oc_hub`. Wider recovery stays with S4.
+
+**Evidence channel.** `READY`, `SUMMARY` and the final `SRC` lines use a bounded retry and failure makes the process exit 4; routine `STAT`/`SRC`/`EVENT` lines are one nonblocking write each and are dropped and counted (`log_dropped`) if the pipe is full. No queue exists on either side beyond the pipe itself.
+
+**Limitations (documented, not hidden).**
+- *Same-instance respawn.* S3B accepts a HELLO for the authorized instance even from a new process whose sequence restarted at 0. The samples then count as regressions and the connection is cut off after 8 strikes, but nothing keeps the process out permanently: once its own seq passes the hub's `last_seq`, the next sample is an ordinary GAP and is accepted (observed in T7). **S4 must allocate a fresh instance for every spawn.**
+- Samples queued behind a BYE, and at SUPERSEDED/SHUTDOWN/ABUSE closes, are discarded unread (S3B behaviour, unchanged).
+- Samples that a reader fails to send *after* its last delivered sample leave no gap at the hub.
+- A reader's stdout pipe being closed by the collector turns critical reports into failures (exit 4) by design.
+
+**Tests.** `tests/test_multiproc.c` (core, in `make test` / `make asan`): T1 no-hub backoff; T2 handshakes, distinct pids; T3 two separately counted streams; T4 backpressure with `SIGSTOP` on the hub; T5 same-process reconnect (`SIGUSR1`); T6 `SIGKILL` of one reader; T9 shutdown with exact accounting (hub accepted == reader sent); T11 shutdown during backoff. `tests/test_multiproc_stress.c` (separate): T7 same-instance respawn; T8 descriptor exhaustion. No assertion depends on a kernel queue capacity; waits are predicates under monotonic deadlines scaled by `OC_TEST_TIME_SCALE`; CPU and exact descriptor-count checks are skipped under Valgrind (`OC_TEST_UNDER_VALGRIND`).
+
+**Observed on the development machine (WSL2, Linux 6.18, GCC 15; SIMULATED; single runs unless noted; not hardware).** Wall time: core suite about 7 s, stress about 13 s, `make asan` about 27 s, `make memcheck-multiproc` about 11 s. T1: 5 connect attempts in 1.6 s with no hub (ladder 100/200/400/800 ms), reader CPU 0-1 ticks. T4: 57-60 `bp_drop` before the hub resumed (the queue depth is a kernel detail and is not asserted). T8: 28-29 hub loop iterations and 3 accept errors in a 1 s window while exhausted; with the listener mask deliberately removed (mutation check) the same window showed 542,990 iterations and 100 CPU ticks, which is what the test is designed to catch. T9: hub `accepted` equalled the reader's `sent` exactly after an orderly stop. Mutation checks confirmed that restarting seq on reconnect, dropping an outcome counter, removing the listener mask, and ignoring signals during backoff each make the suites fail.
+
+**Placeholders / unmeasured.** Handshake timeout (250 ms), stable-connection threshold (1 s), accept backoff constants and the default periods are chosen values, not tuned. Nothing here was measured on the Raspberry Pi.
 
 ## 10. Open low-level review items
 
