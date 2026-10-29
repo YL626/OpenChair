@@ -35,7 +35,7 @@ ASAN_ENV := ASAN_OPTIONS=detect_leaks=1:abort_on_error=0 \
 
 .PHONY: all test asan memcheck run soakcheck clean test-store asan-store memcheck-store \
 	test-roles asan-roles test-multiproc asan-multiproc memcheck-multiproc \
-	test-stress asan-stress
+	test-stress asan-stress test-capture asan-capture memcheck-capture test-m3a asan-m3a memcheck-m3a
 .DEFAULT_GOAL := all
 
 all: $(PLAIN)/openchair
@@ -43,6 +43,7 @@ all: $(PLAIN)/openchair
 test: $(PLAIN)/test_smoke $(PLAIN)/test_sample $(PLAIN)/test_light $(PLAIN)/test_i2c_linux \
 		$(PLAIN)/test_ipc_msg $(PLAIN)/test_ipc $(PLAIN)/test_hub_seq $(PLAIN)/test_hub \
 		$(PLAIN)/test_backoff $(PLAIN)/test_role_args $(PLAIN)/test_multiproc \
+		$(PLAIN)/test_capture_fmt $(PLAIN)/test_capture $(PLAIN)/test_capture_faults \
 		$(PLAIN)/openchair test-store
 	./$(PLAIN)/test_smoke
 	./$(PLAIN)/test_sample
@@ -55,10 +56,14 @@ test: $(PLAIN)/test_smoke $(PLAIN)/test_sample $(PLAIN)/test_light $(PLAIN)/test
 	./$(PLAIN)/test_backoff
 	./$(PLAIN)/test_role_args
 	./$(PLAIN)/test_multiproc
+	./$(PLAIN)/test_capture_fmt
+	./$(PLAIN)/test_capture
+	./$(PLAIN)/test_capture_faults
 
 asan: $(ASAN)/test_smoke $(ASAN)/test_sample $(ASAN)/test_light $(ASAN)/test_i2c_linux \
 		$(ASAN)/test_ipc_msg $(ASAN)/test_ipc $(ASAN)/test_hub_seq $(ASAN)/test_hub \
 		$(ASAN)/test_backoff $(ASAN)/test_role_args $(ASAN)/test_multiproc \
+		$(ASAN)/test_capture_fmt $(ASAN)/test_capture $(ASAN)/test_capture_faults \
 		$(ASAN)/openchair asan-store
 	ASAN_OPTIONS=detect_leaks=1:abort_on_error=0 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
 		./$(ASAN)/test_smoke
@@ -72,6 +77,9 @@ asan: $(ASAN)/test_smoke $(ASAN)/test_sample $(ASAN)/test_light $(ASAN)/test_i2c
 	$(ASAN_ENV) ./$(ASAN)/test_backoff
 	$(ASAN_ENV) ./$(ASAN)/test_role_args
 	$(ASAN_ENV) OC_TEST_TIME_SCALE=$(ASAN_SCALE) ./$(ASAN)/test_multiproc
+	$(ASAN_ENV) ./$(ASAN)/test_capture_fmt
+	$(ASAN_ENV) ./$(ASAN)/test_capture
+	$(ASAN_ENV) ./$(ASAN)/test_capture_faults
 
 
 
@@ -207,6 +215,42 @@ memcheck-multiproc: $(addprefix $(PLAIN)/,$(ROLE_TESTS)) $(PLAIN)/test_multiproc
 		./$(PLAIN)/test_multiproc
 	@echo "memcheck-multiproc: no errors; logs in $(BUILD)/valgrind-mp-*.log"
 
+# M3-A: hub-to-oc_store integration (SIMULATED samples; software-only, NOT M3 evidence).
+# Units/in-process (capture format, capture over a real oc_store, injected storage
+# failures) are part of `make test` / `make asan`. The multiprocess suite (real hub
+# with capture + two reader processes, EFBIG, hub SIGKILL recovery) is dedicated:
+# test-m3a / asan-m3a / memcheck-m3a. The capture directory is persistent evidence
+# and is kept on failure; only directories the harness created are ever deleted.
+CAPTURE_TESTS := test_capture_fmt test_capture test_capture_faults
+
+test-capture: $(addprefix $(PLAIN)/,$(CAPTURE_TESTS))
+	@rc=0; for t in $^; do ./$$t || rc=1; done; exit $$rc
+
+asan-capture: $(addprefix $(ASAN)/,$(CAPTURE_TESTS))
+	@rc=0; for t in $^; do $(ASAN_ENV) ./$$t || rc=1; done; exit $$rc
+
+memcheck-capture: $(addprefix $(PLAIN)/,$(CAPTURE_TESTS))
+	@command -v valgrind >/dev/null || { echo "memcheck-capture: valgrind not installed" >&2; exit 1; }
+	@rc=0; for t in $^; do valgrind -q --error-exitcode=99 --leak-check=full \
+		--errors-for-leak-kinds=definite,possible ./$$t || rc=1; done; exit $$rc
+
+test-m3a: $(PLAIN)/test_multiproc_capture
+	timeout $(MP_TIMEOUT) ./$<
+
+asan-m3a: $(ASAN)/test_multiproc_capture
+	$(ASAN_ENV) OC_TEST_TIME_SCALE=$(ASAN_SCALE) timeout $(MP_TIMEOUT) ./$<
+
+# CPU time and exact descriptor counts are skipped under Valgrind; deadlines are scaled.
+# Per-pid logs for the test and every exec'd child: build/valgrind-m3a-*.log.
+memcheck-m3a: $(PLAIN)/test_multiproc_capture $(PLAIN)/openchair
+	@command -v valgrind >/dev/null || { echo "memcheck-m3a: valgrind not installed" >&2; exit 1; }
+	rm -f $(BUILD)/valgrind-m3a-*.log
+	OC_TEST_UNDER_VALGRIND=1 OC_TEST_TIME_SCALE=$(VALGRIND_SCALE) timeout $$(( $(MP_TIMEOUT) * 4 )) \
+		valgrind --error-exitcode=99 --leak-check=full --errors-for-leak-kinds=definite,possible \
+		--trace-children=yes --child-silent-after-fork=no --log-file=$(BUILD)/valgrind-m3a-%p.log \
+		./$(PLAIN)/test_multiproc_capture
+	@echo "memcheck-m3a: no errors; logs in $(BUILD)/valgrind-m3a-*.log"
+
 run:
 	@echo "NOT AVAILABLE: no application exists yet (only a scaffold CLI)." >&2; exit 1
 
@@ -225,7 +269,7 @@ $(PLAIN)/openchair: $(PLAIN)/main.o $(PLAIN_LIB_OBJ)
 
 # S3C multiprocess suites exec the real openchair binary (OPENCHAIR_BIN) and
 # are given the openchair target as a prerequisite so it is always current.
-$(PLAIN)/test_multiproc $(PLAIN)/test_multiproc_stress: $(PLAIN)/test_%: $(TEST)/test_%.c $(TEST)/mp_harness.h $(PLAIN)/openchair $(PLAIN_LIB_OBJ) | $(PLAIN)
+$(PLAIN)/test_multiproc $(PLAIN)/test_multiproc_stress $(PLAIN)/test_multiproc_capture: $(PLAIN)/test_%: $(TEST)/test_%.c $(TEST)/mp_harness.h $(PLAIN)/openchair $(PLAIN_LIB_OBJ) | $(PLAIN)
 	$(CC) $(CFLAGS_PLAIN) -DOPENCHAIR_BIN='"./$(PLAIN)/openchair"' $< $(PLAIN_LIB_OBJ) -o $@
 
 $(PLAIN)/test_smoke: $(TEST)/test_smoke.c $(PLAIN_LIB_OBJ) | $(PLAIN)
@@ -241,11 +285,12 @@ $(ASAN)/openchair: $(ASAN)/main.o $(ASAN_LIB_OBJ)
 $(ASAN)/test_smoke: $(TEST)/test_smoke.c $(ASAN_LIB_OBJ) | $(ASAN)
 	$(CC) $(CFLAGS_ASAN) $(LDFLAGS_ASAN) -DOPENCHAIR_BIN='"./$(ASAN)/openchair"' $< $(ASAN_LIB_OBJ) -o $@
 
-$(ASAN)/test_multiproc $(ASAN)/test_multiproc_stress: $(ASAN)/test_%: $(TEST)/test_%.c $(TEST)/mp_harness.h $(ASAN)/openchair $(ASAN_LIB_OBJ) | $(ASAN)
+$(ASAN)/test_multiproc $(ASAN)/test_multiproc_stress $(ASAN)/test_multiproc_capture: $(ASAN)/test_%: $(TEST)/test_%.c $(TEST)/mp_harness.h $(ASAN)/openchair $(ASAN_LIB_OBJ) | $(ASAN)
 	$(CC) $(CFLAGS_ASAN) $(LDFLAGS_ASAN) -DOPENCHAIR_BIN='"./$(ASAN)/openchair"' $< $(ASAN_LIB_OBJ) -o $@
 
 # --- oc_store test binaries (LDWRAP is set per target for fault injection) ---
 $(PLAIN)/test_store_faults $(ASAN)/test_store_faults: LDWRAP := $(STORE_WRAP)
+$(PLAIN)/test_capture_faults $(ASAN)/test_capture_faults: LDWRAP := $(STORE_WRAP)
 
 $(PLAIN)/test_%: $(TEST)/test_%.c $(PLAIN_LIB_OBJ) | $(PLAIN)
 	$(CC) $(CFLAGS_PLAIN) $< $(PLAIN_LIB_OBJ) $(LDWRAP) -o $@

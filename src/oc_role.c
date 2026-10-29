@@ -11,6 +11,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include "oc_capture.h"
 #include "oc_role_hub.h"
 #include "oc_role_reader.h"
 
@@ -25,6 +26,7 @@
 enum opt_id {
     O_SIMULATE, O_UNSUP, O_DROPCONN, O_DIR, O_SESSION, O_INSTANCE, O_LIGHT_INST,
     O_DIST_INST, O_PERIOD, O_STAT, O_LIFETIME, O_FAULT, O_HELLO_TO, O_HEADROOM,
+    O_CAP_DIR, O_CAP_MS, O_CAP_ARM, O_CAP_FRESH, O_CAP_SEG, O_CAP_TSEG, O_FSIZE,
     O_COUNT
 };
 
@@ -50,6 +52,13 @@ static const struct optdef OPTS[] = {
     {"--fault-every", true, R_READER, O_FAULT},
     {"--hello-timeout-ms", true, R_HUB, O_HELLO_TO},
     {"--test-fd-headroom", true, R_HUB, O_HEADROOM},
+    {"--capture-dir", true, R_HUB, O_CAP_DIR},
+    {"--capture-ms", true, R_HUB, O_CAP_MS},
+    {"--capture-arm-timeout-ms", true, R_HUB, O_CAP_ARM},
+    {"--capture-fresh-ms", true, R_HUB, O_CAP_FRESH},
+    {"--capture-segment-bytes", true, R_HUB, O_CAP_SEG},
+    {"--capture-trace-segments", true, R_HUB, O_CAP_TSEG},
+    {"--test-fsize-limit", true, R_HUB, O_FSIZE},
 };
 
 static int fail(char *err, size_t cap, const char *what, const char *detail)
@@ -173,6 +182,41 @@ static int apply_opt(struct oc_role_opts *o, const struct optdef *d, const char 
             return fail(err, errcap, "--test-fd-headroom must be 0..64", val);
         o->fd_headroom = (int)v;
         return 0;
+    case O_CAP_DIR:
+        if (val[0] != '/')
+            return fail(err, errcap, "--capture-dir must be an absolute path", val);
+        o->capture_dir = val;
+        return 0;
+    case O_CAP_MS:
+        if (!parse_u64(val, OC_CAPTURE_MAX_MS, &v) || v < 1)
+            return fail(err, errcap, "--capture-ms must be 1..600000 (10 minutes)", val);
+        o->capture_ms = (uint32_t)v;
+        return 0;
+    case O_CAP_ARM:
+        if (!parse_u64(val, 600000, &v) || v < 1)
+            return fail(err, errcap, "--capture-arm-timeout-ms must be 1..600000", val);
+        o->capture_arm_timeout_ms = (uint32_t)v;
+        return 0;
+    case O_CAP_FRESH:
+        if (!parse_u64(val, 60000, &v) || v < 1)
+            return fail(err, errcap, "--capture-fresh-ms must be 1..60000", val);
+        o->capture_fresh_ms = (uint32_t)v;
+        return 0;
+    case O_CAP_SEG:
+        if (!parse_u64(val, 1u << 30, &v) || v < 65624)
+            return fail(err, errcap, "--capture-segment-bytes must be 65624..1073741824", val);
+        o->capture_segment_bytes = (size_t)v;
+        return 0;
+    case O_CAP_TSEG:
+        if (!parse_u64(val, 64, &v) || v < 1)
+            return fail(err, errcap, "--capture-trace-segments must be 1..64", val);
+        o->capture_trace_segments = (uint32_t)v;
+        return 0;
+    case O_FSIZE:
+        if (!parse_u64(val, UINT64_MAX / 2, &v) || v < 1)
+            return fail(err, errcap, "--test-fsize-limit must be >= 1 byte", val);
+        o->test_fsize_limit = v;
+        return 0;
     case O_COUNT:
         break;
     }
@@ -239,7 +283,57 @@ int oc_role_parse(int argc, char **argv, struct oc_role_opts *o, char *err, size
     } else if (!seen[O_INSTANCE]) {
         return fail(err, errcap, "--instance is required", nullptr);
     }
+    if (o->role == OC_ROLE_HUB) {
+        const bool cap_opts = seen[O_CAP_MS] || seen[O_CAP_ARM] || seen[O_CAP_FRESH] ||
+                              seen[O_CAP_SEG] || seen[O_CAP_TSEG] || seen[O_FSIZE];
+        if (cap_opts && !seen[O_CAP_DIR])
+            return fail(err, errcap, "capture options require --capture-dir", nullptr);
+        if (seen[O_CAP_DIR] && oc_role_paths_overlap(o->capture_dir, o->runtime_dir))
+            return fail(err, errcap,
+                        "--capture-dir must be separate from --runtime-dir (the runtime "
+                        "directory is deleted by test cleanup; captured evidence must not be)",
+                        o->capture_dir);
+    }
     return 0;
+}
+
+/* Splits an absolute path into components, ignoring empty ones. Returns the
+ * count or -1 if the path is not absolute or has more than max components. */
+static int split_path(const char *p, const char **start, size_t *len, int max)
+{
+    if (p == nullptr || p[0] != '/')
+        return -1;
+    int n = 0;
+    while (*p != '\0') {
+        while (*p == '/')
+            p++;
+        if (*p == '\0')
+            break;
+        const char *s = p;
+        while (*p != '\0' && *p != '/')
+            p++;
+        if (n >= max)
+            return -1;
+        start[n] = s;
+        len[n] = (size_t)(p - s);
+        n++;
+    }
+    return n;
+}
+
+bool oc_role_paths_overlap(const char *a, const char *b)
+{
+    enum { MAXC = 64 };
+    const char *as[MAXC], *bs[MAXC];
+    size_t al[MAXC], bl[MAXC];
+    int na = split_path(a, as, al, MAXC), nb = split_path(b, bs, bl, MAXC);
+    if (na < 0 || nb < 0)
+        return true;                    /* cannot prove they are apart: fail closed */
+    int n = na < nb ? na : nb;
+    for (int i = 0; i < n; i++)
+        if (al[i] != bl[i] || memcmp(as[i], bs[i], al[i]) != 0)
+            return false;               /* diverge: neither contains the other */
+    return true;                        /* one is a prefix of (or equal to) the other */
 }
 
 int oc_role_socket_path(const struct oc_role_opts *o, char *out, size_t cap)
@@ -265,7 +359,11 @@ void oc_role_usage(FILE *out)
     fputs("usage: openchair --role hub --simulate --unsupervised-test --runtime-dir DIR\n"
           "                 --session-id HEX [--light-instance N] [--distance-instance N]\n"
           "                 [--stat-ms N] [--lifetime-ms N]\n"
+          "                 [--capture-dir DIR [--capture-ms N] [--capture-arm-timeout-ms N]\n"
+          "                  [--capture-fresh-ms N]]   (M3-A: store SIMULATED samples via oc_store)\n"
           "                 [--hello-timeout-ms N] [--test-fd-headroom N]   (testing)\n"
+          "                 [--capture-segment-bytes N] [--capture-trace-segments N]\n"
+          "                 [--test-fsize-limit BYTES]                      (testing)\n"
           "       openchair --role light|distance --simulate --runtime-dir DIR\n"
           "                 --session-id HEX --instance N [--period-ms N] [--stat-ms N]\n"
           "                 [--lifetime-ms N] [--fault-every N]\n"

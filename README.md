@@ -89,6 +89,8 @@ The build is native to Linux/WSL2 (GCC, GNU Make). There is no cross-compilation
 | `make memcheck-store` | The same storage tests under Valgrind. It reports Valgrind errors separately from test failures. |
 | `make test-multiproc` / `asan-multiproc` / `memcheck-multiproc` | S3C **core** multiprocess suite alone (real hub + two reader processes, SIMULATED samples): plain, under ASan/UBSan, and under Valgrind with every exec'd child traced (`build/valgrind-mp-*.log`). The core suite is also part of `make test` and `make asan`. |
 | `make test-stress` / `make asan-stress` | S3C **stress/negative** scenarios, kept out of `make test`: real descriptor exhaustion in the hub (T8) and same-instance respawn with a reset sequence (T7). |
+| `make test-capture` / `asan-capture` / `memcheck-capture` | M3-A capture units: payload codec, `oc_capture` over a **real** `oc_store` (exact read-back, arming, tick schedule, reused directory), and injected storage failures. Part of `make test` / `make asan`. |
+| `make test-m3a` / `asan-m3a` / `memcheck-m3a` | M3-A **multiprocess** suite (dedicated, not in `make test`): real hub with capture + two reader processes, real `EFBIG`, hub `SIGKILL` recovery. `memcheck-m3a` traces every child (`build/valgrind-m3a-*.log`). |
 | `make test-roles` / `asan-roles` | Unit tests of the pure S3C modules (backoff, simulated source, option parsing). |
 | `make clean` | Removes `build/`. |
 | `make run`, `make soakcheck` | **Not available.** Print a message and exit nonzero; no application or soak test exists. |
@@ -111,6 +113,15 @@ openchair --role help        # full option list, including the testing controls
 - Testing controls, available only with `--simulate` / `--unsupervised-test`: `--fault-every N` (every Nth attempt is a TIMEOUT), `--drop-conn-on-sigusr1` (SIGUSR1 makes a reader drop its socket and reconnect in the same process, keeping instance and sequence), `--hello-timeout-ms`, `--test-fd-headroom N` (hub lowers `RLIMIT_NOFILE` after start-up so only N more descriptors can be opened).
 - Each process prints `key=value` lines on stdout: `READY`, `STAT`/`SRC`, `EVENT`, `SUMMARY`. `READY` and `SUMMARY` are delivered with a bounded retry and a failure to deliver them makes the process exit 4; routine lines are dropped (and counted) rather than queued if the reader of the pipe is slow. A process killed with SIGKILL writes no `SUMMARY`.
 - Exit codes: 0 clean, 2 usage, 3 configuration or permanent HELLO rejection, 4 runtime failure.
+
+### M3-A capture mode (SIMULATED, software-only)
+
+`openchair --role hub ... --capture-dir DIR [--capture-ms N]` persists the samples the hub accepts from both readers (a source that is silent for longer than `--capture-fresh-ms` inside the window fails the capture) into `oc_store`'s trace stream during a bounded window (default 60 s, hard maximum 600 s), then syncs, reads them back, closes, reopens and reads back again, and prints `CAPRESULT`/`CAPSRC`/`CAPRB`/`CAPSTORE`/`CAPLAT` lines (`PASS` or `FAIL` with named flags). `STORE_RECOVER` reports what recovery found when the store was opened.
+
+- `DIR` holds **persistent evidence** and must be an existing directory *separate from* `--runtime-dir` (the socket directory, which test cleanup deletes). The hub refuses overlapping paths, including via symlinks.
+- Everything here is **SIMULATED**. It exercises the same hub-to-`oc_store` path a LIVE capture will use, but it is **not M3 evidence**: M3 requires both real sensors on the Raspberry Pi. The VL6180X reader is not yet merged and the ADS1115 path is unverified on hardware.
+- A storage failure does not stop sensing; every accepted-but-unstored sample is counted and the capture FAILS. The supervisor's fallback log does not exist yet; failures are reported on the structured stdout lines and stderr.
+- Testing controls (hub, only with `--unsupervised-test`): `--capture-segment-bytes`, `--capture-trace-segments`, `--test-fsize-limit` (real `RLIMIT_FSIZE`).
 
 Plain and sanitizer builds use separate object trees and are never mixed; Valgrind runs only on the plain build because it is incompatible with ASan.
 

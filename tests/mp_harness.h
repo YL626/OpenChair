@@ -52,7 +52,7 @@
 #define LIGHT_INST 7u
 #define DIST_INST 9u
 #define LINE_CAP 512u
-#define MAX_CHILD 8
+#define MAX_CHILD 24
 #define RECENT_N 12u
 
 enum { SRC_NONE = 0, SRC_LIGHT = 1, SRC_DIST = 2 };
@@ -74,6 +74,14 @@ struct child {
     unsigned src_n[3];
     char fin[LINE_CAP];
     char summary[LINE_CAP];
+    /* M3-A capture lines (hub): latest of each kind */
+    char store_recover[LINE_CAP], store_fail[LINE_CAP], store_open_failed[LINE_CAP];
+    char cap_progress[LINE_CAP];
+    unsigned cap_progress_n;
+    char cap_result[LINE_CAP], cap_store[LINE_CAP];
+    char cap_src[3][LINE_CAP];
+    char cap_rb[2][LINE_CAP];          /* [0] pass=sync, [1] pass=reopen */
+    char cap_lat[4][LINE_CAP];         /* callback, append, tick, sync */
     char recent[RECENT_N][LINE_CAP];
     unsigned recent_n;
 };
@@ -90,6 +98,7 @@ static int g_t_fail0;
 static const char *g_t_name = "";
 static int g_t_total, g_t_passed;
 static char g_dir[64];
+static char g_dir_created[64];   /* exact string mkdtemp produced: the only runtime path we may delete */
 static char g_sock[108];   /* fits sockaddr_un.sun_path */
 
 #define CHECK(cond)                                                          \
@@ -158,25 +167,58 @@ static bool kv_eq(const char *line, const char *key, const char *val)
 
 /* ---------- output draining ---------- */
 
+/* Bounded copy that may be given a source inside the same object (the line
+ * being parsed lives in the child's buffer): memmove, not snprintf. */
+static void copy_line(char *dst, const char *src)
+{
+    size_t n = strnlen(src, LINE_CAP - 1);
+    memmove(dst, src, n);
+    dst[n] = '\0';
+}
+
 static void store_line(struct child *c, const char *line)
 {
     c->nlines++;
-    snprintf(c->recent[c->recent_n % RECENT_N], LINE_CAP, "%s", line);
+    copy_line(c->recent[c->recent_n % RECENT_N], line);
     c->recent_n++;
     if (strncmp(line, "READY ", 6) == 0) {
-        snprintf(c->ready, LINE_CAP, "%s", line);
+        copy_line(c->ready, line);
     } else if (strncmp(line, "STAT ", 5) == 0) {
-        snprintf(c->stat, LINE_CAP, "%s", line);
+        copy_line(c->stat, line);
         c->stat_n++;
     } else if (strncmp(line, "FINAL ", 6) == 0) {
-        snprintf(c->fin, LINE_CAP, "%s", line);
+        copy_line(c->fin, line);
     } else if (strncmp(line, "SUMMARY ", 8) == 0) {
-        snprintf(c->summary, LINE_CAP, "%s", line);
+        copy_line(c->summary, line);
+    } else if (strncmp(line, "STORE_RECOVER ", 14) == 0) {
+        copy_line(c->store_recover, line);
+    } else if (strncmp(line, "STORE_OPEN_FAILED ", 18) == 0) {
+        copy_line(c->store_open_failed, line);
+    } else if (strncmp(line, "STORE_FAIL ", 11) == 0) {
+        copy_line(c->store_fail, line);
+    } else if (strncmp(line, "CAPTURE ", 8) == 0) {
+        copy_line(c->cap_progress, line);
+        c->cap_progress_n++;
+    } else if (strncmp(line, "CAPRESULT ", 10) == 0) {
+        copy_line(c->cap_result, line);
+    } else if (strncmp(line, "CAPSTORE ", 9) == 0) {
+        copy_line(c->cap_store, line);
+    } else if (strncmp(line, "CAPSRC ", 7) == 0) {
+        int idx = kv_eq(line, "src", "light") ? SRC_LIGHT : kv_eq(line, "src", "distance") ? SRC_DIST : SRC_NONE;
+        if (idx != SRC_NONE)
+            copy_line(c->cap_src[idx], line);
+    } else if (strncmp(line, "CAPRB ", 6) == 0) {
+        copy_line(c->cap_rb[kv_eq(line, "pass", "reopen") ? 1 : 0], line);
+    } else if (strncmp(line, "CAPLAT ", 7) == 0) {
+        int k = kv_eq(line, "what", "callback") ? 0 : kv_eq(line, "what", "append") ? 1
+                : kv_eq(line, "what", "tick") ? 2 : kv_eq(line, "what", "sync") ? 3 : -1;
+        if (k >= 0)
+            copy_line(c->cap_lat[k], line);
     } else if (strncmp(line, "SRC ", 4) == 0) {
         int idx = kv_eq(line, "src", "light") ? SRC_LIGHT
                   : kv_eq(line, "src", "distance") ? SRC_DIST : SRC_NONE;
         if (idx != SRC_NONE) {
-            snprintf(c->src[idx], LINE_CAP, "%s", line);
+            copy_line(c->src[idx], line);
             c->src_n[idx]++;
         }
     }
@@ -276,7 +318,7 @@ static void pump(int ms)
     } while (0)
 
 /* Drain for `ms` of wall time regardless of data (a measurement window). */
-static void run_for(int ms)
+[[maybe_unused]] static void run_for(int ms)
 {
     uint64_t end = mono_ns() + (uint64_t)ms * 1000000ull;
     for (;;) {
@@ -478,9 +520,74 @@ static int rm_cb(const char *path, const struct stat *sb, int flag, struct FTW *
     return remove(path);
 }
 
-static void rmtree(const char *path)
+/* Directories the harness creates carry a marker file. It deletes ONLY a path
+ * that is a real directory (not a symlink) and still holds the marker file the
+ * harness wrote when it created it; for the runtime directory it also compares
+ * with the exact string mkdtemp returned. Anything else is left alone and the
+ * run fails. The marker (not the string compare) is the real guard for the
+ * capture directories. */
+#define OWNED_MARKER ".oc-test-owned"
+
+static bool mark_owned(const char *dir)
 {
-    nftw(path, rm_cb, 8, FTW_DEPTH | FTW_PHYS);
+    char m[160];
+    snprintf(m, sizeof m, "%s/%s", dir, OWNED_MARKER);
+    int fd = open(m, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0)
+        return false;
+    close(fd);
+    return true;
+}
+
+static bool is_owned(const char *dir, const char *created)
+{
+    struct stat sb, mb;
+    char m[160];
+    if (dir == nullptr || created == nullptr || strcmp(dir, created) != 0)
+        return false;
+    if (lstat(dir, &sb) != 0 || !S_ISDIR(sb.st_mode))
+        return false;
+    snprintf(m, sizeof m, "%s/%s", dir, OWNED_MARKER);
+    return lstat(m, &mb) == 0 && S_ISREG(mb.st_mode);
+}
+
+static void rmtree_owned(const char *dir, const char *created)
+{
+    if (!is_owned(dir, created)) {
+        fprintf(stderr, "FAIL: refusing to delete %s (not a directory this run created)\n", dir);
+        g_failures++;
+        return;
+    }
+    nftw(dir, rm_cb, 8, FTW_DEPTH | FTW_PHYS);
+}
+
+/* Persistent capture directory (M3-A): separate from the runtime directory,
+ * kept on failure so evidence is not destroyed, removed only on success. */
+#define MAX_CAPDIRS 8
+static char g_capdirs[MAX_CAPDIRS][64];
+static int g_ncapdirs;
+static char g_capdir[64];            /* the newest one */
+
+[[maybe_unused]] static void capdir_make(void)
+{
+    const char *tmp = getenv("TMPDIR");
+    if (g_ncapdirs >= MAX_CAPDIRS) {
+        fputs("too many capture dirs\n", stderr);
+        exit(2);
+    }
+    char *d = g_capdirs[g_ncapdirs];
+    if (tmp != nullptr && strlen(tmp) >= 20) {
+        fputs("TMPDIR too long for the harness's fixed-size paths; use a shorter one\n", stderr);
+        exit(2);
+    }
+    snprintf(d, sizeof g_capdirs[0], "%s/oc-s3c-cap-XXXXXX", tmp != nullptr ? tmp : "/tmp");
+    if (mkdtemp(d) == nullptr || !mark_owned(d)) {
+        perror("capdir");
+        exit(2);
+    }
+    g_ncapdirs++;
+    snprintf(g_capdir, sizeof g_capdir, "%s", d);
+    printf("[capture dir %s]\n", g_capdir);
 }
 
 static void harness_init(unsigned hard_timeout_s)
@@ -491,10 +598,11 @@ static void harness_init(unsigned hard_timeout_s)
     g_valgrind = getenv("OC_TEST_UNDER_VALGRIND") != nullptr;
     const char *tmp = getenv("TMPDIR");
     snprintf(g_dir, sizeof g_dir, "%s/oc-s3c-XXXXXX", tmp != nullptr && strlen(tmp) < 24 ? tmp : "/tmp");
-    if (mkdtemp(g_dir) == nullptr) {
+    if (mkdtemp(g_dir) == nullptr || !mark_owned(g_dir)) {
         perror("mkdtemp");
         exit(2);
     }
+    snprintf(g_dir_created, sizeof g_dir_created, "%s", g_dir);
     if (snprintf(g_sock, sizeof g_sock, "%s/hub.sock", g_dir) >= (int)sizeof g_sock) {
         fputs("runtime dir path too long for a socket\n", stderr);
         exit(2);
@@ -549,7 +657,7 @@ static void harness_init(unsigned hard_timeout_s)
 }
 
 /* utime+stime in clock ticks, or -1. */
-static long cpu_ticks(pid_t pid)
+[[maybe_unused]] static long cpu_ticks(pid_t pid)
 {
     char p[64], buf[1024];
     snprintf(p, sizeof p, "/proc/%d/stat", (int)pid);
@@ -657,7 +765,7 @@ static void harness_teardown(void)
     }
     CHECK(access(g_sock, F_OK) != 0);
     CHECK(!unix_socket_listed(g_sock));
-    rmtree(g_dir);
+    rmtree_owned(g_dir, g_dir_created);
     CHECK(access(g_dir, F_OK) != 0);
 }
 
@@ -665,6 +773,12 @@ static int harness_finish(const char *suite)
 {
     if (g_failures != 0)
         dump_recent();
+    for (int i = 0; i < g_ncapdirs; i++) {
+        if (g_failures == 0)
+            rmtree_owned(g_capdirs[i], g_capdirs[i]);       /* persistent evidence: removed only when the run passed */
+        else
+            printf("[capture dir KEPT for inspection: %s]\n", g_capdirs[i]);
+    }
     printf("%s: %d/%d scenarios passed, %d failed check(s) [SIMULATED]\n", suite, g_t_passed,
            g_t_total, g_failures);
     return g_failures == 0 ? 0 : 1;

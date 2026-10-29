@@ -150,6 +150,74 @@ static void test_rejections(void)
     CHECK(rc == -EINVAL && strlen(err) > 0);
 }
 
+
+static void test_capture_options(void)
+{
+    struct oc_role_opts o;
+    char err[160];
+    int rc;
+    PARSE(rc, o, "hub", "--simulate", "--unsupervised-test", "--runtime-dir", "/tmp/rt", "--session-id", "1",
+          "--capture-dir", "/tmp/cap", "--capture-ms", "600000", "--capture-arm-timeout-ms", "1500",
+          "--capture-fresh-ms", "250", "--capture-segment-bytes", "65624", "--capture-trace-segments", "4",
+          "--test-fsize-limit", "100000");
+    CHECK(rc == 0);
+    CHECK(strcmp(o.capture_dir, "/tmp/cap") == 0 && o.capture_ms == 600000 && o.capture_arm_timeout_ms == 1500 &&
+          o.capture_fresh_ms == 250 && o.capture_segment_bytes == 65624 && o.capture_trace_segments == 4 &&
+          o.test_fsize_limit == 100000);
+    PARSE(rc, o, "hub", "--simulate", "--unsupervised-test", "--runtime-dir", "/tmp/rt", "--session-id", "1");
+    CHECK(rc == 0 && o.capture_dir == nullptr && o.capture_ms == 0);            /* capture off by default */
+
+    /* the 10-minute cap is enforced at the CLI */
+    PARSE(rc, o, "hub", "--simulate", "--unsupervised-test", "--runtime-dir", "/tmp/rt", "--session-id", "1",
+          "--capture-dir", "/tmp/cap", "--capture-ms", "600001");
+    CHECK(rc == -EINVAL);
+    PARSE(rc, o, "hub", "--simulate", "--unsupervised-test", "--runtime-dir", "/tmp/rt", "--session-id", "1",
+          "--capture-dir", "/tmp/cap", "--capture-ms", "0");
+    CHECK(rc == -EINVAL);
+    /* capture sub-options need --capture-dir */
+    PARSE(rc, o, "hub", "--simulate", "--unsupervised-test", "--runtime-dir", "/tmp/rt", "--session-id", "1",
+          "--capture-ms", "1000");
+    CHECK(rc == -EINVAL);
+    PARSE(rc, o, "hub", "--simulate", "--unsupervised-test", "--runtime-dir", "/tmp/rt", "--session-id", "1",
+          "--test-fsize-limit", "1000");
+    CHECK(rc == -EINVAL);
+    /* absolute, and never the runtime dir or inside/around it */
+    PARSE(rc, o, "hub", "--simulate", "--unsupervised-test", "--runtime-dir", "/tmp/rt", "--session-id", "1",
+          "--capture-dir", "cap");
+    CHECK(rc == -EINVAL);
+    PARSE(rc, o, "hub", "--simulate", "--unsupervised-test", "--runtime-dir", "/tmp/rt", "--session-id", "1",
+          "--capture-dir", "/tmp/rt");
+    CHECK(rc == -EINVAL && strstr(err, "separate") != nullptr);
+    PARSE(rc, o, "hub", "--simulate", "--unsupervised-test", "--runtime-dir", "/tmp/rt", "--session-id", "1",
+          "--capture-dir", "/tmp/rt/captures");
+    CHECK(rc == -EINVAL);
+    PARSE(rc, o, "hub", "--simulate", "--unsupervised-test", "--runtime-dir", "/tmp/rt/sub", "--session-id", "1",
+          "--capture-dir", "/tmp");
+    CHECK(rc == -EINVAL);
+    /* segment below the store's minimum */
+    PARSE(rc, o, "hub", "--simulate", "--unsupervised-test", "--runtime-dir", "/tmp/rt", "--session-id", "1",
+          "--capture-dir", "/tmp/cap", "--capture-segment-bytes", "65623");
+    CHECK(rc == -EINVAL);
+    /* readers do not take capture options */
+    PARSE(rc, o, "light", "--simulate", "--runtime-dir", "/tmp/rt", "--session-id", "1", "--instance", "1",
+          "--capture-dir", "/tmp/cap");
+    CHECK(rc == -EINVAL);
+}
+
+static void test_paths_overlap(void)
+{
+    CHECK(oc_role_paths_overlap("/tmp/a", "/tmp/a"));
+    CHECK(oc_role_paths_overlap("/tmp/a/", "/tmp/a"));
+    CHECK(oc_role_paths_overlap("/tmp//a", "/tmp/a/b"));
+    CHECK(oc_role_paths_overlap("/tmp/a/b", "/tmp/a"));
+    CHECK(oc_role_paths_overlap("/", "/tmp/a"));
+    CHECK(!oc_role_paths_overlap("/tmp/a", "/tmp/ab"));               /* a prefix of the NAME is not a parent */
+    CHECK(!oc_role_paths_overlap("/tmp/a", "/tmp/b"));
+    CHECK(!oc_role_paths_overlap("/var/cap", "/tmp/oc-s3c-x"));
+    CHECK(oc_role_paths_overlap("rel", "/tmp/a"));                    /* not absolute: fail closed */
+    CHECK(oc_role_paths_overlap("/tmp/a", nullptr));
+}
+
 static void test_socket_path_limits(void)
 {
     struct oc_role_opts o = {.runtime_dir = "/tmp/x"};
@@ -173,6 +241,8 @@ int main(void)
     test_hub_ok();
     test_rejections();
     test_socket_path_limits();
+    test_capture_options();
+    test_paths_overlap();
     if (failures != 0) {
         fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;

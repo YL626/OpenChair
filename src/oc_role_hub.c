@@ -4,13 +4,16 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
 #include <unistd.h>
 
 #include "oc_backoff.h"
+#include "oc_capture.h"
 #include "oc_clock.h"
 #include "oc_hub.h"
 #include "oc_runlog.h"
@@ -30,6 +33,10 @@ struct hub_run {
     struct src_acc acc[OC_SOURCE_DISTANCE + 1];
     uint64_t backoffs;          /* accept-error backoffs entered */
     uint64_t iter;              /* main-loop iterations */
+    struct oc_capture *cap;     /* M3-A capture, or NULL */
+    bool cap_reported;          /* final CAPRESULT lines emitted */
+    bool store_fail_reported;
+    int cap_report_rc;          /* nonzero if a critical capture report was not delivered */
 };
 
 static const char *src_name(unsigned s)
@@ -59,6 +66,8 @@ static const char *close_name(enum oc_hub_close_reason r)
 static void on_sample(void *ctx, const struct oc_hub_sample_info *i)
 {
     struct hub_run *h = ctx;
+    if (h->cap != nullptr)
+        oc_capture_on_sample(h->cap, i);       /* persists inside the window; times itself */
     if (i->source > OC_SOURCE_DISTANCE || i->source == 0)
         return;
     struct src_acc *a = &h->acc[i->source];
@@ -78,6 +87,8 @@ static void on_sample(void *ctx, const struct oc_hub_sample_info *i)
 static void on_event(void *ctx, const struct oc_hub_event *e)
 {
     struct hub_run *h = ctx;
+    if (h->cap != nullptr)
+        oc_capture_on_event(h->cap, e);
     switch (e->kind) {
     case OC_HUB_EV_SOURCE_UP:
         (void)oc_runlog_line(&h->log, "EVENT ev=SOURCE_UP src=%s inst=%u gen=%u reconnect=%d reset=%d",
@@ -152,11 +163,184 @@ static void fmt_hub_stat(struct hub_run *h, const struct oc_hub *hub, const char
         (unsigned long long)s.abusive_closes, (unsigned long long)h->log.dropped);
 }
 
+static void emit_capture_progress(struct hub_run *h);
+
 static void emit_periodic(struct hub_run *h, const struct oc_hub *hub)
 {
     fmt_hub_stat(h, hub, "STAT");
     (void)fmt_src(h, hub, OC_SOURCE_LIGHT, false);
     (void)fmt_src(h, hub, OC_SOURCE_DISTANCE, false);
+    emit_capture_progress(h);
+}
+
+
+/* ---------- capture reporting (M3-A) ---------- */
+
+static const char *cap_state_name(enum oc_capture_state s)
+{
+    switch (s) {
+    case OC_CAP_ARMED: return "ARMED";
+    case OC_CAP_RUNNING: return "RUNNING";
+    case OC_CAP_ENDED: return "ENDED";
+    case OC_CAP_DONE: return "DONE";
+    }
+    return "?";
+}
+
+static unsigned long long us(uint64_t ns)
+{
+    return (unsigned long long)(ns / 1000u);
+}
+
+/* Routine progress line while a capture exists and its store is open. */
+static void emit_capture_progress(struct hub_run *h)
+{
+    if (h->cap == nullptr || oc_capture_state(h->cap) == OC_CAP_DONE)
+        return;
+    struct oc_store_status s;
+    memset(&s, 0, sizeof s);
+    const bool have = oc_capture_store_status(h->cap, &s) == 0;
+    const struct oc_capture_src *L = oc_capture_src(h->cap, OC_SOURCE_LIGHT);
+    const struct oc_capture_src *D = oc_capture_src(h->cap, OC_SOURCE_DISTANCE);
+    const struct oc_capture_result *r = oc_capture_result(h->cap);
+    char fl[160];
+    oc_capture_flags_str(oc_capture_flags(h->cap), fl, sizeof fl);
+    const struct oc_store_stream_status *t = &s.stream[OC_STREAM_TRACE];
+    (void)oc_runlog_line(
+        &h->log,
+        "CAPTURE state=%s flags=%s origin=SIMULATED have_seq=%d first_store_seq=%llu last_store_seq=%llu "
+        "appended=%llu store=%s buffered=%llu written=%llu durable=%llu uncertain=%llu has_durable=%d "
+        "durable_seq=%llu l_acc=%llu l_ok=%llu l_fail=%llu l_ns=%llu d_acc=%llu d_ok=%llu d_fail=%llu "
+        "d_ns=%llu tick_fail=%llu",
+        cap_state_name(oc_capture_state(h->cap)), fl, r->have_store_seq,
+        (unsigned long long)r->first_store_seq, (unsigned long long)r->last_store_seq,
+        (unsigned long long)r->records_appended, have ? (s.state == OC_STORE_OK ? "OK" : "FAILED") : "CLOSED",
+        (unsigned long long)t->buffered, (unsigned long long)t->written, (unsigned long long)t->durable,
+        (unsigned long long)t->uncertain, t->has_durable, (unsigned long long)t->durable_seq,
+        (unsigned long long)L->accepted_window, (unsigned long long)L->append_ok,
+        (unsigned long long)L->append_fail, (unsigned long long)L->accepted_not_stored,
+        (unsigned long long)D->accepted_window, (unsigned long long)D->append_ok,
+        (unsigned long long)D->append_fail, (unsigned long long)D->accepted_not_stored,
+        (unsigned long long)r->tick_fail);
+}
+
+#define CRIT(h, ...)                                                                      \
+    do {                                                                                  \
+        int crc_ = oc_runlog_critical(&(h)->log, OC_HUB_ROLE_CRITICAL_MS, __VA_ARGS__);   \
+        if (crc_ != 0 && (h)->cap_report_rc == 0)                                         \
+            (h)->cap_report_rc = crc_;                                                    \
+    } while (0)
+
+static void report_rb(struct hub_run *h, const char *name, const struct oc_cap_rb *rb)
+{
+    CRIT(h,
+         "CAPRB pass=%s done=%d rc=%d records=%llu decode_err=%llu foreign=%llu order_err=%llu "
+         "contiguous=%d first_seen=%llu last_seen=%llu l_samples=%llu l_prov=%d d_samples=%llu d_prov=%d",
+         name, rb->done, rb->rc, (unsigned long long)rb->records, (unsigned long long)rb->decode_errors,
+         (unsigned long long)rb->foreign_records, (unsigned long long)rb->order_errors,
+         rb->store_seq_contiguous, (unsigned long long)rb->first_store_seq_seen,
+         (unsigned long long)rb->last_store_seq_seen,
+         (unsigned long long)rb->src[OC_SOURCE_LIGHT].samples, rb->src[OC_SOURCE_LIGHT].provenance_ok,
+         (unsigned long long)rb->src[OC_SOURCE_DISTANCE].samples, rb->src[OC_SOURCE_DISTANCE].provenance_ok);
+}
+
+static void lat_line(struct hub_run *h, const char *what, const struct oc_lat *l)
+{
+    CRIT(h, "CAPLAT what=%s n=%llu max_us=%llu total_us=%llu gt1ms=%llu gt10ms=%llu gt100ms=%llu", what,
+         (unsigned long long)l->n, us(l->max_ns), us(l->total_ns), (unsigned long long)l->over_1ms,
+         (unsigned long long)l->over_10ms, (unsigned long long)l->over_100ms);
+}
+
+/* Finishes the capture (sync, verify, close, reopen, verify) and emits the
+ * CRITICAL result lines. A line that cannot be delivered is surfaced through
+ * h->cap_report_rc (the process then exits 4). */
+static void finish_and_report(struct hub_run *h)
+{
+    if (h->cap == nullptr || h->cap_reported)
+        return;
+    struct oc_capture_result r;
+    (void)oc_capture_finish(h->cap, &r);
+    h->cap_reported = true;
+    char fl[160];
+    oc_capture_flags_str(r.flags, fl, sizeof fl);
+    const struct oc_store_stream_status *t = &r.status.stream[OC_STREAM_TRACE];
+    CRIT(h,
+         "CAPRESULT verdict=%s flags=%s origin=SIMULATED window_ms=%llu have_seq=%d first_store_seq=%llu "
+         "last_store_seq=%llu appended=%llu store_failed=%d store_errno=%d tick_fail=%llu sync_fail=%llu "
+         "sync_rc=%d close_rc=%d reopen_rc=%d reopen_done=%d status_valid=%d store=%s buffered=%llu "
+         "written=%llu durable=%llu uncertain=%llu durable_seq=%llu finish_ms=%llu",
+         r.verdict == OC_CAP_PASS ? "PASS" : "FAIL", fl, (unsigned long long)(r.window_ns / 1000000u),
+         r.have_store_seq, (unsigned long long)r.first_store_seq, (unsigned long long)r.last_store_seq,
+         (unsigned long long)r.records_appended, r.store_failed, r.store_errno,
+         (unsigned long long)r.tick_fail, (unsigned long long)r.sync_fail, r.sync_rc, r.close_rc,
+         r.reopen_rc, r.reopen_done, r.status_valid, r.status.state == OC_STORE_OK ? "OK" : "FAILED",
+         (unsigned long long)t->buffered, (unsigned long long)t->written, (unsigned long long)t->durable,
+         (unsigned long long)t->uncertain, (unsigned long long)t->durable_seq,
+         (unsigned long long)(r.finish_ns / 1000000u));
+    for (unsigned s = OC_SOURCE_LIGHT; s <= OC_SOURCE_DISTANCE; s++) {
+        const struct oc_capture_src *x = &r.src[s];
+        CRIT(h,
+             "CAPSRC src=%s pre=%llu accepted=%llu ok=%llu fail=%llu not_stored=%llu post=%llu "
+             "non_ok=%llu gaps=%llu ts_back=%llu went_down=%d inst_changed=%d inst=%u first_seq=%u "
+             "last_seq=%u last_store_seq=%llu rb0=%llu rb1=%llu",
+             src_name(s), (unsigned long long)x->pre_window, (unsigned long long)x->accepted_window,
+             (unsigned long long)x->append_ok, (unsigned long long)x->append_fail,
+             (unsigned long long)x->accepted_not_stored, (unsigned long long)x->post_window,
+             (unsigned long long)x->non_ok, (unsigned long long)x->gaps,
+             (unsigned long long)x->ts_backwards, x->went_down, x->instance_changed, x->instance,
+             x->first_seq, x->last_seq, (unsigned long long)x->last_store_seq,
+             (unsigned long long)r.rb[0].src[s].samples, (unsigned long long)r.rb[1].src[s].samples);
+    }
+    report_rb(h, "sync", &r.rb[0]);
+    report_rb(h, "reopen", &r.rb[1]);
+    const struct oc_store_stream_report *o = &r.rec_open.stream[OC_STREAM_TRACE];
+    const struct oc_store_stream_report *p = &r.rec_reopen.stream[OC_STREAM_TRACE];
+    CRIT(h,
+         "CAPSTORE open_kept=%llu open_torn=%llu open_damaged=%u open_removed=%u open_gaps=%llu "
+         "open_next_seq=%llu reopen_kept=%llu reopen_torn=%llu reopen_damaged=%u reopen_removed=%u "
+         "reopen_gaps=%llu reopen_next_seq=%llu",
+         (unsigned long long)o->records_kept, (unsigned long long)o->torn_bytes, o->damaged_segments,
+         o->removed_segments, (unsigned long long)o->seq_gaps, (unsigned long long)o->next_seq,
+         (unsigned long long)p->records_kept, (unsigned long long)p->torn_bytes, p->damaged_segments,
+         p->removed_segments, (unsigned long long)p->seq_gaps, (unsigned long long)p->next_seq);
+    lat_line(h, "callback", &r.lat_cb);
+    lat_line(h, "append", &r.lat_append);
+    lat_line(h, "tick", &r.lat_tick);
+    lat_line(h, "sync", &r.lat_sync);
+    if (r.verdict != OC_CAP_PASS)
+        fprintf(stderr, "openchair: hub: capture FAILED (%s); SIMULATED data, not M3 evidence either way\n", fl);
+}
+
+/* Once per failure: surface a storage failure the moment it is latched. */
+static void note_store_failure(struct hub_run *h)
+{
+    if (h->cap == nullptr || h->store_fail_reported ||
+        (oc_capture_flags(h->cap) & OC_CAPF_STORE_FAILED) == 0)
+        return;
+    h->store_fail_reported = true;
+    char fl[160];
+    oc_capture_flags_str(oc_capture_flags(h->cap), fl, sizeof fl);
+    CRIT(h, "STORE_FAIL origin=SIMULATED flags=%s errno=%d (sensing continues; nothing is retried or reported durable)",
+         fl, oc_capture_result(h->cap)->store_errno);
+    fprintf(stderr, "openchair: hub: storage failed (%s); samples are no longer being stored\n", fl);
+}
+
+static void emit_store_recover(struct hub_run *h, const char *dir, const struct oc_store_report *r, int rc)
+{
+    if (rc != 0) {
+        CRIT(h, "STORE_OPEN_FAILED dir=%s rc=%d (capture cannot run; sensing continues)", dir, rc);
+        fprintf(stderr, "openchair: hub: oc_store_open(%s) failed (%d); capture disabled\n", dir, rc);
+        return;
+    }
+    const struct oc_store_stream_report *t = &r->stream[OC_STREAM_TRACE];
+    const struct oc_store_stream_report *e = &r->stream[OC_STREAM_EVIDENCE];
+    CRIT(h,
+         "STORE_RECOVER dir=%s trace_kept=%llu trace_torn=%llu trace_damaged=%u trace_removed=%u "
+         "trace_gaps=%llu trace_next_seq=%llu ev_kept=%llu ev_torn=%llu ev_next_seq=%llu",
+         dir, (unsigned long long)t->records_kept, (unsigned long long)t->torn_bytes, t->damaged_segments,
+         t->removed_segments, (unsigned long long)t->seq_gaps, (unsigned long long)t->next_seq,
+         (unsigned long long)e->records_kept, (unsigned long long)e->torn_bytes,
+         (unsigned long long)e->next_seq);
 }
 
 static int timeout_until(uint64_t now, uint64_t deadline)
@@ -200,6 +384,7 @@ static int hub_loop(struct hub_run *h, struct oc_hub *hub, const struct oc_role_
     if (clk->now_ns(clk->ctx, &now) != 0)
         return OC_ROLE_EXIT_RUNTIME;
     uint64_t next_stat = now + (uint64_t)o->stat_ms * MS_NS;
+    uint64_t next_cap_tick = now;
     uint64_t end_ns = o->lifetime_ms != 0 ? now + o->lifetime_ms * MS_NS : 0;
     bool stop = false;
 
@@ -219,6 +404,8 @@ static int hub_loop(struct hub_run *h, struct oc_hub *hub, const struct oc_role_
             dl = end_ns;
         if (in_backoff && backoff_until < dl)
             dl = backoff_until;
+        if (h->cap != nullptr && !h->cap_reported && next_cap_tick < dl)
+            dl = next_cap_tick;             /* oc_store_tick is due even if no sample arrives */
         int tmo = dl == UINT64_MAX ? 1000 : timeout_until(now, dl);
 
         struct pollfd fds[1 + OC_HUB_MAX_POLLFDS];
@@ -247,6 +434,11 @@ static int hub_loop(struct hub_run *h, struct oc_hub *hub, const struct oc_role_
                 if (sigs[i] == SIGTERM || sigs[i] == SIGINT)
                     stop = true;
         }
+        if (h->cap != nullptr && !h->cap_reported) {
+            uint64_t t_poll = 0;
+            if (clk->now_ns(clk->ctx, &t_poll) == 0)
+                oc_capture_clock(h->cap, t_poll);      /* close an expired window BEFORE this dispatch's events/samples */
+        }
         int drc = oc_hub_dispatch(hub, fds + 1, n);
         if (drc < 0 && drc != -EINTR) {
             fprintf(stderr, "openchair: hub: dispatch failed (%d)\n", drc);
@@ -268,6 +460,19 @@ static int hub_loop(struct hub_run *h, struct oc_hub *hub, const struct oc_role_
         }
         seen_accepted = st.conns_accepted;
 
+        if (h->cap != nullptr && !h->cap_reported) {
+            uint64_t tnow = now;
+            if (clk->now_ns(clk->ctx, &tnow) == 0 && tnow >= next_cap_tick) {
+                (void)oc_capture_tick(h->cap, tnow);
+                next_cap_tick = tnow + (uint64_t)OC_CAPTURE_TICK_MS * MS_NS;
+            }
+            note_store_failure(h);
+            if (oc_capture_state(h->cap) == OC_CAP_ENDED) {
+                finish_and_report(h);       /* sync + read-back may take a while; reported as finish_ms */
+                if (h->cap_report_rc != 0)
+                    return OC_ROLE_EXIT_RUNTIME;
+            }
+        }
         if (o->stat_ms != 0 && now >= next_stat) {
             emit_periodic(h, hub);
             next_stat = now + (uint64_t)o->stat_ms * MS_NS;
@@ -313,15 +518,61 @@ int oc_role_hub_run(const struct oc_role_opts *o)
     cfg.initial[OC_SOURCE_DISTANCE].authorized = o->have_distance_instance;
     cfg.initial[OC_SOURCE_DISTANCE].instance = o->distance_instance;
 
+    int code = OC_ROLE_EXIT_OK;
+    if (o->capture_dir != nullptr) {
+        /* Persistent evidence must never share a tree with the runtime (socket) directory. */
+        char rc_dir[PATH_MAX], rd_dir[PATH_MAX];
+        if (realpath(o->capture_dir, rc_dir) == nullptr || realpath(o->runtime_dir, rd_dir) == nullptr) {
+            fprintf(stderr, "openchair: hub: --capture-dir and --runtime-dir must both exist\n");
+            close(sfd);
+            return OC_ROLE_EXIT_CONFIG;
+        }
+        if (oc_role_paths_overlap(rc_dir, rd_dir)) {
+            fprintf(stderr, "openchair: hub: capture dir %s overlaps runtime dir %s\n", rc_dir, rd_dir);
+            close(sfd);
+            return OC_ROLE_EXIT_CONFIG;
+        }
+        const struct oc_capture_cfg ccfg = {.dir = rc_dir,
+                                            .duration_ms = o->capture_ms,
+                                            .arm_timeout_ms = o->capture_arm_timeout_ms,
+                                            .fresh_ms = o->capture_fresh_ms,
+                                            .expected_origin = OC_ORIGIN_SIMULATED,
+                                            .trace_segment_bytes = o->capture_segment_bytes,
+                                            .trace_segments = o->capture_trace_segments};
+        struct oc_store_report srep;
+        memset(&srep, 0, sizeof srep);
+        rc = oc_capture_new(&ccfg, &h.cap, &srep);
+        if (h.cap == nullptr) {
+            fprintf(stderr, "openchair: hub: capture setup failed (%d)\n", rc);
+            close(sfd);
+            return rc == -EINVAL || rc == -ENAMETOOLONG ? OC_ROLE_EXIT_CONFIG : OC_ROLE_EXIT_RUNTIME;
+        }
+        emit_store_recover(&h, rc_dir, &srep, rc);      /* STORE_RECOVER or STORE_OPEN_FAILED */
+        if (o->test_fsize_limit != 0 && rc == 0) {
+            /* Testing control: real EFBIG from the kernel. SIGXFSZ must not kill the hub. */
+            struct sigaction ign = {.sa_handler = SIG_IGN};
+            sigemptyset(&ign.sa_mask);
+            struct rlimit rl;
+            if (sigaction(SIGXFSZ, &ign, nullptr) != 0 || getrlimit(RLIMIT_FSIZE, &rl) != 0) {
+                fprintf(stderr, "openchair: hub: cannot prepare the fsize test limit\n");
+                code = OC_ROLE_EXIT_RUNTIME;
+            } else {
+                rl.rlim_cur = (rlim_t)o->test_fsize_limit;
+                if (setrlimit(RLIMIT_FSIZE, &rl) != 0)
+                    code = OC_ROLE_EXIT_RUNTIME;
+            }
+        }
+    }
+
     static struct oc_hub hub;            /* large; zero-initialized, one per process */
     rc = oc_hub_init(&hub, &cfg);
     if (rc != 0) {
         fprintf(stderr, "openchair: hub: oc_hub_init failed (%d)\n", rc);
+        oc_capture_free(h.cap);
         close(sfd);
         return rc == -EINVAL || rc == -ENAMETOOLONG ? OC_ROLE_EXIT_CONFIG : OC_ROLE_EXIT_RUNTIME;
     }
 
-    int code = OC_ROLE_EXIT_OK;
     struct rlimit saved_nofile;
     bool limit_lowered = false;
     if (o->fd_headroom >= 0) {
@@ -351,6 +602,12 @@ int oc_role_hub_run(const struct oc_role_opts *o)
     if (code == OC_ROLE_EXIT_OK)
         code = hub_loop(&h, &hub, o, sfd, &clk);
 
+    finish_and_report(&h);                /* no-op unless a capture exists and was not yet reported */
+    if (h.cap_report_rc != 0) {
+        fprintf(stderr, "openchair: hub: capture report not delivered (%d)\n", h.cap_report_rc);
+        if (code == OC_ROLE_EXIT_OK)
+            code = OC_ROLE_EXIT_RUNTIME;
+    }
     if (limit_lowered)                   /* give back the descriptors needed for orderly exit work */
         (void)setrlimit(RLIMIT_NOFILE, &saved_nofile);
 
@@ -374,6 +631,7 @@ int oc_role_hub_run(const struct oc_role_opts *o)
             code = OC_ROLE_EXIT_RUNTIME;
     }
     close(sfd);
+    oc_capture_free(h.cap);
     oc_runlog_restore(&h.log);
     return code;
 }

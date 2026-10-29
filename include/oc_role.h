@@ -22,7 +22,12 @@
  *
  * Testing controls (readers, only with --simulate; hub, only with
  * --unsupervised-test): --fault-every, --drop-conn-on-sigusr1,
- * --hello-timeout-ms, --test-fd-headroom, --lifetime-ms. */
+ * --hello-timeout-ms, --test-fd-headroom, --lifetime-ms, --capture-segment-bytes,
+ * --capture-trace-segments, --test-fsize-limit.
+ *
+ * Capture mode (hub only, --capture-dir): see oc_capture.h. The capture
+ * directory holds persistent evidence and must be separate from the runtime
+ * (socket) directory, which test code deletes. */
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -58,6 +63,14 @@ struct oc_role_opts {
     uint32_t fault_every;            /* readers: testing control */
     uint32_t hello_timeout_ms;       /* hub: 0 = hub default */
     int fd_headroom;                 /* hub: -1 = off, else descriptors allowed after init */
+    /* hub capture mode (M3-A): persists accepted SIMULATED samples via oc_store */
+    const char *capture_dir;         /* NULL = capture off; absolute, existing, NOT the runtime dir */
+    uint32_t capture_ms;             /* 0 = OC_CAPTURE_DEFAULT_MS; max OC_CAPTURE_MAX_MS */
+    uint32_t capture_arm_timeout_ms; /* 0 = default */
+    uint32_t capture_fresh_ms;       /* 0 = default */
+    size_t capture_segment_bytes;    /* testing: trace segment size, 0 = default */
+    uint32_t capture_trace_segments; /* testing: trace ring length, 0 = default */
+    uint64_t test_fsize_limit;       /* testing: RLIMIT_FSIZE in bytes after the store opens; 0 = off */
 };
 
 /* Parses argv[0..argc) where argv[1] is "--role" and argv[2] the role name.
@@ -65,6 +78,12 @@ struct oc_role_opts {
  * duplicates, missing or malformed values, options not valid for the role and
  * missing required options are all errors. */
 int oc_role_parse(int argc, char **argv, struct oc_role_opts *o, char *err, size_t errcap);
+
+/* True if either path equals, contains or lies inside the other, comparing
+ * normalized components (repeated and trailing slashes ignored). Both must be
+ * absolute; otherwise true (fail closed). Purely lexical: the runner also
+ * compares realpath() results. */
+bool oc_role_paths_overlap(const char *a, const char *b);
 
 /* "<runtime_dir>/hub.sock" into out. 0, or -ENAMETOOLONG (does not fit
  * sockaddr_un) / -EINVAL. */
