@@ -59,6 +59,8 @@ Mechanisms E (multiprocess fault isolation) and D (custom crash-consistent stora
 │   ├── IMPLEMENTATION_NOTES.md
 │   ├── oc_store.md       # storage format, sync policy, recovery, open decisions
 │   └── oc_store_tests.md # storage test map
+├── tools/
+│   └── distance_probe.c  # live VL6180X bring-up probe (make probe)
 ├── tests/                # automated tests
 │   ├── test_smoke.c      # smoke test of the scaffold CLI
 │   ├── test_store.c      # oc_store functional tests
@@ -87,6 +89,8 @@ The build is native to Linux/WSL2 (GCC, GNU Make). There is no cross-compilation
 | `make test-store` | Builds and runs only the `oc_store` storage tests (`tests/test_store*.c`) with synthetic input; see `docs/oc_store_tests.md`. Set `TMPDIR` to put the test stores on a disk-backed filesystem (by default `/tmp`, often tmpfs, where `fdatasync` is a no-op). |
 | `make asan-store` | The same storage tests under ASan/UBSan. |
 | `make memcheck-store` | The same storage tests under Valgrind. It reports Valgrind errors separately from test failures. |
+| `make test-distance` / `asan-distance` / `memcheck-distance` | Runs only the VL6180X driver and distance-adapter tests (`tests/test_distance.c`) against a **simulated** sensor. Also part of `make test` and `make asan`; see `docs/vl6180x.md`. |
+| `make probe` | Builds `build/plain/distance_probe`, a live bring-up tool that reads the VL6180X over `/dev/i2c-N` and prints timestamped LIVE samples. It only reads a real sensor on the Pi; the procedure is in `docs/vl6180x.md` §4. |
 | `make clean` | Removes `build/`. |
 | `make run`, `make soakcheck` | **Not available.** Print a message and exit nonzero; no application or soak test exists. |
 | `make deploy` | Does not exist. |

@@ -38,7 +38,7 @@ all: $(PLAIN)/openchair
 
 all: $(PLAIN)/openchair
 
-test: $(PLAIN)/test_smoke $(PLAIN)/test_sample $(PLAIN)/test_light $(PLAIN)/test_i2c_linux $(PLAIN)/test_distance $(PLAIN)/openchair test-store
+test: $(PLAIN)/test_smoke $(PLAIN)/test_sample $(PLAIN)/test_light $(PLAIN)/test_i2c_linux $(PLAIN)/test_distance $(PLAIN)/openchair $(PLAIN)/distance_probe test-store
 	./$(PLAIN)/test_smoke
 	./$(PLAIN)/test_sample
 	./$(PLAIN)/test_light
@@ -121,6 +121,14 @@ asan-distance: $(ASAN)/test_distance
 memcheck-distance: $(PLAIN)/test_distance
 	@command -v valgrind >/dev/null || { echo "memcheck-distance: valgrind not installed" >&2; exit 1; }
 	valgrind -q --error-exitcode=99 --leak-check=full --errors-for-leak-kinds=definite,possible ./$<
+
+# Live VL6180X probe (docs/vl6180x.md). Builds anywhere; reads hardware only
+# on a Pi: ./build/plain/distance_probe /dev/i2c-1 50 100
+.PHONY: probe
+probe: $(PLAIN)/distance_probe
+
+$(PLAIN)/distance_probe: tools/distance_probe.c $(PLAIN_LIB_OBJ) | $(PLAIN)
+	$(CC) $(CFLAGS_PLAIN) $< $(PLAIN_LIB_OBJ) -o $@
 
 run:
 	@echo "NOT AVAILABLE: no application exists yet (only a scaffold CLI)." >&2; exit 1
