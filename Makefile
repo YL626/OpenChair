@@ -21,8 +21,8 @@ ASAN := $(BUILD)/asan
 PLAIN_LIB_OBJ := $(addprefix $(PLAIN)/,$(LIB_NAMES))
 ASAN_LIB_OBJ := $(addprefix $(ASAN)/,$(LIB_NAMES))
 
-# oc_store tests. Written before the implementation: until src/oc_store.c is
-# real these targets are EXPECTED TO FAIL. They move into `make test` once green.
+# oc_store tests (docs/oc_store_tests.md). Run by test/asan/memcheck, and on
+# their own by test-store/asan-store/memcheck-store.
 STORE_TESTS := test_store test_store_faults test_store_kill
 # Fault-injection seam: the faults binary routes oc_store's write/sync calls
 # through __wrap_* functions in tests/test_store_faults.c.
@@ -43,7 +43,7 @@ all: $(PLAIN)/openchair
 test: $(PLAIN)/test_smoke $(PLAIN)/test_sample $(PLAIN)/test_light $(PLAIN)/test_i2c_linux \
 		$(PLAIN)/test_ipc_msg $(PLAIN)/test_ipc $(PLAIN)/test_hub_seq $(PLAIN)/test_hub \
 		$(PLAIN)/test_backoff $(PLAIN)/test_role_args $(PLAIN)/test_multiproc \
-		$(PLAIN)/openchair
+		$(PLAIN)/openchair test-store
 	./$(PLAIN)/test_smoke
 	./$(PLAIN)/test_sample
 	./$(PLAIN)/test_light
@@ -59,7 +59,7 @@ test: $(PLAIN)/test_smoke $(PLAIN)/test_sample $(PLAIN)/test_light $(PLAIN)/test
 asan: $(ASAN)/test_smoke $(ASAN)/test_sample $(ASAN)/test_light $(ASAN)/test_i2c_linux \
 		$(ASAN)/test_ipc_msg $(ASAN)/test_ipc $(ASAN)/test_hub_seq $(ASAN)/test_hub \
 		$(ASAN)/test_backoff $(ASAN)/test_role_args $(ASAN)/test_multiproc \
-		$(ASAN)/openchair
+		$(ASAN)/openchair asan-store
 	ASAN_OPTIONS=detect_leaks=1:abort_on_error=0 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
 		./$(ASAN)/test_smoke
 	$(ASAN_ENV) ./$(ASAN)/test_sample
@@ -73,7 +73,9 @@ asan: $(ASAN)/test_smoke $(ASAN)/test_sample $(ASAN)/test_light $(ASAN)/test_i2c
 	$(ASAN_ENV) ./$(ASAN)/test_role_args
 	$(ASAN_ENV) OC_TEST_TIME_SCALE=$(ASAN_SCALE) ./$(ASAN)/test_multiproc
 
-memcheck: $(PLAIN)/test_smoke $(PLAIN)/openchair
+
+
+memcheck: $(PLAIN)/test_smoke $(PLAIN)/openchair memcheck-store
 	@command -v valgrind >/dev/null || { echo "memcheck: valgrind not installed" >&2; exit 1; }
 	valgrind --error-exitcode=1 --leak-check=full --errors-for-leak-kinds=definite,possible \
 		--trace-children=yes --log-file=$(BUILD)/valgrind-%p.log ./$(PLAIN)/test_smoke

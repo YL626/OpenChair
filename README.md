@@ -4,7 +4,7 @@ OpenChair is a handheld Raspberry Pi-based diagnostic reader for powered wheelch
 
 The software will decode supported, verified controller-specific patterns and show an understandable explanation. Unknown or unreliable readings must not produce an invented diagnosis; the device will instead offer retry or manual code entry. The product is designed to operate fully offline.
 
-> **Status: early development.** No sensor support, diagnostic logic, supervisor or real application exists yet. The repository contains project documentation, a working native Linux/WSL2 C23 build and test system, host-tested IPC/hub/reader modules, and a CLI whose `--role` testing processes run a SIMULATED three-process demonstration (see below). Nothing has been run on the Raspberry Pi or with live sensors.
+> **Status: early development.** No sensor support, diagnostic logic, supervisor or real application exists yet. The repository contains project documentation, a working native Linux/WSL2 C23 build and test system, host-tested IPC/hub/reader modules, a CLI whose `--role` testing processes run a SIMULATED three-process demonstration (see below), and the `oc_store` storage library (Mechanism D) with its host-side tests. Everything is tested with synthetic or SIMULATED input only; `oc_store` is not yet integrated into the hub. Nothing has been run on the Raspberry Pi or with live sensors.
 
 ## Target hardware
 
@@ -47,11 +47,24 @@ Mechanisms E (multiprocess fault isolation) and D (custom crash-consistent stora
 ├── .gitignore
 ├── src/                  # C23 systems implementation
 │   ├── main.c            # scaffold CLI (--version, --help); not the application
-│   └── version.c         # scaffold version string
+│   ├── version.c         # scaffold version string
+│   ├── crc32.c           # CRC-32/IEEE
+│   ├── oc_store.c        # oc_store storage library (Mechanism D)
+│   └── oc_store_format.{c,h}  # oc_store on-disk byte layout (private)
 ├── include/              # public/shared C headers
-│   └── openchair_version.h
+│   ├── openchair_version.h
+│   ├── oc_crc32.h
+│   └── oc_store.h        # oc_store API [REVIEW]
+├── docs/
+│   ├── IMPLEMENTATION_NOTES.md
+│   ├── oc_store.md       # storage format, sync policy, recovery, open decisions
+│   └── oc_store_tests.md # storage test map
 ├── tests/                # automated tests
 │   ├── test_smoke.c      # smoke test of the scaffold CLI
+│   ├── test_store.c      # oc_store functional tests
+│   ├── test_store_faults.c  # oc_store write/sync fault injection
+│   ├── test_store_kill.c    # oc_store fork + SIGKILL crash trials
+│   ├── test_util.h       # shared test helpers
 │   └── fixtures/         # simulated/replayed sensor data (empty)
 ├── YL626/
 │   ├── PROMPTLOG.md
@@ -68,11 +81,11 @@ The build is native to Linux/WSL2 (GCC, GNU Make). There is no cross-compilation
 | Target | Behavior |
 |--------|----------|
 | `make` / `make all` | Builds `build/plain/openchair`. |
-| `make test` | Builds and runs the smoke test (`build/plain/`). It runs the real `openchair` binary and checks its output and exit status. A failing check makes `make test` exit nonzero. |
-| `make asan` | Rebuilds in a separate tree (`build/asan/`) with AddressSanitizer + UBSan (UBSan findings are fatal) and runs the same smoke test. |
-| `make memcheck` | Runs the plain (non-sanitized) smoke test and its `openchair` children under Valgrind, failing on any error or definite/possible leak. Logs go to `build/valgrind-*.log`. Requires `valgrind` to be installed. |
-| `make test-store` | Builds and runs the `oc_store` storage tests (`tests/test_store*.c`). **Expected to fail** until the storage library is implemented (it is currently a stub); see `docs/oc_store_tests.md`. |
-| `make asan-store` | The same storage tests under ASan/UBSan. Also expected to fail until implemented. |
+| `make test` | Builds and runs the `oc_store` storage tests and the smoke test (`build/plain/`). The smoke test runs the real `openchair` binary and checks its output and exit status. A failing check makes `make test` exit nonzero. |
+| `make asan` | Rebuilds in a separate tree (`build/asan/`) with AddressSanitizer + UBSan (UBSan findings are fatal) and runs the same storage and smoke tests. |
+| `make memcheck` | Runs the plain (non-sanitized) storage tests, the smoke test and its `openchair` children under Valgrind, failing on any error or definite/possible leak. Logs go to `build/valgrind-*.log`. Requires `valgrind` to be installed. |
+| `make test-store` | Builds and runs only the `oc_store` storage tests (`tests/test_store*.c`) with synthetic input; see `docs/oc_store_tests.md`. Set `TMPDIR` to put the test stores on a disk-backed filesystem (by default `/tmp`, often tmpfs, where `fdatasync` is a no-op). |
+| `make asan-store` | The same storage tests under ASan/UBSan. |
 | `make memcheck-store` | The same storage tests under Valgrind. It reports Valgrind errors separately from test failures. |
 | `make test-multiproc` / `asan-multiproc` / `memcheck-multiproc` | S3C **core** multiprocess suite alone (real hub + two reader processes, SIMULATED samples): plain, under ASan/UBSan, and under Valgrind with every exec'd child traced (`build/valgrind-mp-*.log`). The core suite is also part of `make test` and `make asan`. |
 | `make test-stress` / `make asan-stress` | S3C **stress/negative** scenarios, kept out of `make test`: real descriptor exhaustion in the hub (T8) and same-instance respawn with a reset sequence (T7). |
@@ -101,4 +114,4 @@ openchair --role help        # full option list, including the testing controls
 
 Plain and sanitizer builds use separate object trees and are never mixed; Valgrind runs only on the plain build because it is incompatible with ASan.
 
-Verified on WSL2 Ubuntu (GCC 15.2.0, Make 4.4.1, Valgrind 3.26.0): `make test`, `make asan`, and `make memcheck` pass. This is software-only verification. Nothing here has been verified on a Raspberry Pi or with live hardware.
+Verified on WSL2 Ubuntu (GCC 15.2.0, Make 4.4.1, Valgrind 3.26.0): `make test`, `make asan`, and `make memcheck` pass. With the storage tests added, `make test`, `make asan` and `make memcheck` also pass on Fedora (GCC 16.2.1). This is software-only verification. Nothing here has been verified on a Raspberry Pi or with live hardware.

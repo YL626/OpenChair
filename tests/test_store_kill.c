@@ -44,6 +44,11 @@
 
 #define KILL_SEED 0x0C5701E5u   /* fixed: failures are reproducible */
 #define SEG_BYTES (80u * 1024u) /* ~20 records per segment, so kills hit rollovers */
+/* The evidence cap (tested in test_store.c) must not be what stops a child:
+ * a child keeps writing until the kill lands, so give it room for far more
+ * records than any trial writes. A child that hits the cap exits 3, which
+ * fails the trial loudly rather than passing it. */
+#define MAX_SEGS 100000u
 
 static size_t len_4k(uint64_t seq)
 {
@@ -249,6 +254,7 @@ static void kill_trials(enum kill_mode mode, int trials)
         REQUIRE(tu_mkdtemp(dir, sizeof dir) == 0);
         struct oc_store_cfg cfg = tu_cfg(dir);
         cfg.stream[OC_STREAM_EVIDENCE].segment_bytes = SEG_BYTES;
+        cfg.stream[OC_STREAM_EVIDENCE].max_segments = MAX_SEGS;
         REQUIRE(run_and_kill(&cfg, mode, k, delay, &acked) == 0);
         CHECK(acked >= k);   /* k acks were received before the kill */
         check_after_kill(&cfg, 0, acked, 1, &n);
@@ -285,6 +291,7 @@ static void test_kill_repeated_same_store(void)
     REQUIRE(tu_mkdtemp(dir, sizeof dir) == 0);
     struct oc_store_cfg cfg = tu_cfg(dir);
     cfg.stream[OC_STREAM_EVIDENCE].segment_bytes = SEG_BYTES;
+    cfg.stream[OC_STREAM_EVIDENCE].max_segments = MAX_SEGS;
     for (int round = 0; round < ROUNDS; round++) {
         int before = tu_failures;
         uint64_t acked = 0, n = 0;

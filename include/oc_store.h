@@ -3,17 +3,25 @@
 
 /* oc_store: crash-consistent append-only storage (Mechanism D).
  *
- * STATUS: [REVIEW] proposed interface, following DESIGN.md §4 and
- * docs/IMPLEMENTATION_NOTES.md §5-7. Open decisions are listed in
- * docs/oc_store_tests.md. The current src/oc_store.c is a stub that
- * returns -ENOSYS so the test suite compiles and fails until implemented.
+ * STATUS: [REVIEW] interface following DESIGN.md §4 and
+ * docs/IMPLEMENTATION_NOTES.md §5-7, implemented in src/oc_store.c.
+ * File format, sync policy, recovery rules and the decisions awaiting
+ * partner review: docs/oc_store.md. Tests: docs/oc_store_tests.md.
  *
- * Concurrency: single writer, not thread-safe. Only the hub uses it.
+ * Concurrency: single writer, not thread-safe. Only the hub uses it. A read
+ * visitor must not call back into the store.
  *
- * Errors: every int-returning call returns 0 on success or a negative errno
- * (-EINVAL for bad arguments, -EIO/-ENOSPC/... from the OS). An invalid
- * argument never changes store state. Any I/O failure moves the store to
- * OC_STORE_FAILED, after which nothing is acknowledged as durable.
+ * Errors: every int-returning call returns 0 on success or a negative errno.
+ * An invalid argument (-EINVAL) never changes store state. Any I/O failure
+ * (-EIO, -ENOSPC, -EFBIG, ...) moves the store to OC_STORE_FAILED: records
+ * not yet durable become uncertain, nothing is acknowledged as durable
+ * again, and every later append/tick/sync returns -EBADFD. status, read and
+ * close still work. Other codes:
+ *   -EDQUOT   append: the evidence stream is at its max_segments cap. The
+ *             record is refused; the store stays OK and trace is unaffected.
+ *   -ENODATA  sync: the stream holds no records.
+ *   -EBADMSG  read: a segment changed on disk after open; nothing invented.
+ * Output parameters (*seq_out, *durable_seq) are written only on success.
  *
  * Record data states (DESIGN.md §4):
  *   buffered  - in this process's memory; lost if the process dies
@@ -102,6 +110,8 @@ enum oc_store_state {
     OC_STORE_FAILED = 1
 };
 
+/* The four counts cover records appended through this handle since open.
+ * has_durable/durable_seq also cover records kept by recovery at open. */
 struct oc_store_stream_status {
     uint64_t buffered;
     uint64_t written;
@@ -162,12 +172,14 @@ int oc_store_sync(struct oc_store *st, enum oc_stream stream,
 int oc_store_status(const struct oc_store *st, struct oc_store_status *out);
 
 /* Calls visit for each valid stored record of the stream with seq >= from_seq,
- * in seq order. */
+ * in seq order. Records still buffered are not visible; written records are,
+ * including, after a failure, records whose sync failed (uncertain). */
 int oc_store_read(struct oc_store *st, enum oc_stream stream, uint64_t from_seq,
                   oc_store_visit_fn visit, void *ctx);
 
 /* Syncs, seals the active segments and frees the store. Returns the first
- * error encountered; the store is freed either way. NULL is a no-op. */
+ * error encountered (on a FAILED store: the failure's -errno, with no I/O);
+ * the store is freed either way. NULL is a no-op. */
 int oc_store_close(struct oc_store *st);
 
 #endif
