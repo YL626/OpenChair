@@ -1,6 +1,6 @@
 # OpenChair Implementation Notes
 
-Supplement to `DESIGN.md`. `DESIGN.md` is authoritative; if the two disagree, `DESIGN.md` wins and this file is corrected. These notes hold low-level detail removed from the design document. Everything here is **[REVIEW]**: the architecture is team-agreed, but byte-level and API-level details await technical review by the owning and consuming partner. **Implementation status.** Host-tested on Linux with SIMULATED inputs: the sample codec (S1), the ADS1115 light reader (S2, against a fake I2C bus), the IPC control codec and transport (S3A), and the hub receiver and per-source state machine (S3B), and a three-process SIMULATED run of hub plus two reader roles over real sockets (S3C, section 9a), and the SIMULATED hub-to-`oc_store` capture (M3-A, section 9b). The VL6180X reader and its adapter (host-tested against a fake sensor), and the LIVE input backends for both readers (M3-B, section 9c; host-tested against fakes only). Not implemented: the supervisor and control channel, storage integration beyond the M3-A capture, the optical analysis, the UI, and the assembled application. Nothing here has been measured or verified on the Raspberry Pi hardware; passing host tests shows logic only. **[MEASURE]** marks values that need hardware data.
+Supplement to `DESIGN.md`. `DESIGN.md` is authoritative; if the two disagree, `DESIGN.md` wins and this file is corrected. These notes hold low-level detail removed from the design document. Everything here is **[REVIEW]**: the architecture is team-agreed, but byte-level and API-level details await technical review by the owning and consuming partner. **Implementation status.** Host-tested on Linux with SIMULATED inputs: the sample codec (S1), the ADS1115 light reader (S2, against a fake I2C bus), the IPC control codec and transport (S3A), and the hub receiver and per-source state machine (S3B), and a three-process SIMULATED run of hub plus two reader roles over real sockets (S3C, section 9a), and the SIMULATED hub-to-`oc_store` capture (M3-A, section 9b). The VL6180X reader and its adapter (host-tested against a fake sensor; completed in section 9d), and the LIVE input backends for both readers (M3-B, section 9c; host-tested against fakes only). Not implemented: the supervisor and control channel, storage integration beyond the M3-A capture, the optical analysis, the UI, and the assembled application. Nothing here has been measured or verified on the Raspberry Pi hardware; passing host tests shows logic only. **[MEASURE]** marks values that need hardware data.
 
 ## 1. oc_sample wire format
 
@@ -186,6 +186,26 @@ Single-writer, not thread-safe, used by the hub only. Data states: *buffered* (p
 **Tools.** `tools/light_probe.c` (`make probe-light`, `docs/light_probe.md`) is the ADS1115 counterpart of `distance_probe`: raw CSV, no IPC.
 
 **Tests.** `test_role_args` (modes, conflicts, restrictions), `test_reader_backend` (selection, seq ownership across failures and recovery, origin from the bus, clock failure, no descriptor left after a failed open; fakes only), and `test_multiproc_live`: L1 LIVE hub rejects a SIMULATED reader; L2/L3 LIVE reader refuses a missing or non-I2C device; L4 labels; L5/L6 run the real reader loop (`oc_role_reader_run_backend`) over a **fake** bus whose origin is set to LIVE **only to exercise enforcement mechanics**: accepted by a LIVE hub, reconnect keeps the adapter and sequence, a scripted NACK stream stays honest, and a LIVE-labelled capture passes. Nothing in these tests is hardware evidence.
+
+## 9d. VL6180X reader completed; `oc_position` placement gate (Kacper; awaiting Alan's review)
+
+Details are in `docs/vl6180x.md`. In summary:
+
+- **Driver.** Setup writes and reads back every ranging setting the driver relies on, including max convergence, 1x scaling and interleaved mode off; a mismatch is `-EPROTO`, which becomes IO_ERR.
+- **Silent-reset check.** Each attempt on a set-up device first reads `SYSTEM__FRESH_OUT_OF_RESET`, so a reset without a failed transfer is detected.
+- **Chip faults.** Range codes 1–5 force re-setup. They stay RANGE_ERR with the raw byte in `aux`, so the `oc_sample` contract is unchanged.
+- **Offset calibration.** Optional, defaulting to the factory value, so `OC_VL6180X_CFG_DEFAULT` behaves as before. `distance_probe --calibrate` suggests an offset.
+- **Adapter counters.** `oc_distance_get_stats` exposes them.
+- **No change to Alan-owned files.**
+
+**`oc_position` [REVIEW: Alan].** A pure verdict over distance samples:
+- verdicts: UNAVAILABLE, FAULT, NO_TARGET, SETTLING, OUT_OF_RANGE, MOVING, STABLE;
+- the window is emptied by non-OK samples, seq breaks and backwards time;
+- the verdict's origin is LIVE only if the whole window is LIVE.
+
+It is the distance-side half of "a capture is accepted only while the distance stream shows the reader in range and stable" (DESIGN.md §1). It is **not called by the hub**: using it in fusion, and choosing which verdicts reject a capture, is Alan's decision (DESIGN.md §7). Thresholds are **[MEASURE]**.
+
+**Host-tested only.** The original single-shot driver ran LIVE in the 2026-10-30 M3 demo (seen in a video; raw logs not yet committed). The additions above have not run on hardware.
 
 ## 10. Open low-level review items
 

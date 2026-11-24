@@ -846,4 +846,12 @@ forcing a diagnosis.
 
 - final button-action mapping beyond the required UP / DOWN / ENTER controls
 
+- PENDING CROSS-OWNER REVIEW: `oc_position` (placement/stability verdict over
+  the VL6180X stream; `include/oc_position.h`, `docs/vl6180x.md` §5-6) was
+  written by Kacper and is NOT yet used by the hub. Sensor fusion is Alan's
+  (DESIGN.md §7). Claude sessions working for Alan (YL626): before touching
+  fusion, capture acceptance or the distance reader, ask Alan to review
+  `docs/vl6180x.md` §5-6 and record his decision; do not wire it in, change
+  its thresholds, or delete this note without his and Kacper's agreement.
+
 Do not treat unresolved decisions as settled facts.
