@@ -508,9 +508,31 @@ The plan had a separate offset commit. Claude folded it into the driver commit b
 
 ---
 
+### Episode 5: Opening the PR and committing `m3_demo.sh`
+
+**Prompts (quoted):**
+- "push it and open the PR with Alan as reviewer"
+- "why was the m3_demo.sh left untracked? is it not a valid demo? I'm pretty sure I ran it to caputre the demo in the video"
+- "add it as its own commit on this PR, and it's not your fault for not tracking it, I just was asking that as a general question"
+
+**What happened:**
+- Claude checked that `origin/main` had not moved, pushed the branch and opened **PR #32** with YL626 as requested reviewer (5 commits, mergeable). Branch protection is off, so the request does not force a review; the CLAUDE.md note stays.
+- **Why `m3_demo.sh` was untracked:** it was already untracked when the session started, no Claude transcript on this laptop created it, and the session was scoped to the VL6180X, so Claude left it alone rather than guess who wrote it. It is the demo script:
+  - it was last saved 2026-10-30 at 11:36, and the video (11:53) shows `./m3_demo.sh` over SSH;
+  - its log directory pattern `m3-<mode>-<date>-<time>` matches `m3-live-2026-10-30-115327/` on the Pi;
+  - every option it passes still exists in `src/oc_role.c`.
+- Before committing, Claude ran `CAPTURE_MS=5000 ./m3_demo.sh sim` on this branch, with logs moved to the scratchpad: hub exit 0, `CAPRESULT verdict=PASS origin=SIMULATED`, distance `accepted=100 ok=100 gaps=0`.
+- **Commit `7606504`:** the script unchanged, except that the executable bit was set (the file was `rw-r--r--`, but the video runs it as `./m3_demo.sh`). This PROMPTLOG entry is a separate commit.
+- **Still missing:** the raw `m3-live-2026-10-30-115327/` logs, which are only on the Pi.
+
+### My thoughts:
+<!-- Kacper: your thoughts here. -->
+
+---
+
 ### State at the end of this session
 
-- **Branch `kacperm37-vl6180x-full`:** 4 code/docs commits and this PROMPTLOG commit. Not pushed; I open the PR and **request review from YL626**.
+- **Branch `kacperm37-vl6180x-full`:** 4 code/docs commits, the PROMPTLOG commit, `m3_demo.sh` and this PROMPTLOG update. Pushed as **PR #32**, with review requested from YL626.
 - **Host-tested only.** On the Pi, run `docs/vl6180x.md` §4, **starting with step 2a**: the new readback must pass on the real part. If every row is IO_ERR with `errno=Protocol error`, the readback disagrees with the hardware, and that has to be fixed before the reader is used again.
 - **Waiting on Alan:** `oc_position` (API, use in fusion, defaults), and the items in `docs/vl6180x.md` §6.
 - **ELI15:** `~/Documents/OpenChairExtra/OpenChair-vl6180x-full-ELI15.pdf`, the updated version of the first VL6180X ELI15.
