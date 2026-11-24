@@ -44,8 +44,8 @@ test: $(PLAIN)/test_smoke $(PLAIN)/test_sample $(PLAIN)/test_light $(PLAIN)/test
 		$(PLAIN)/test_ipc_msg $(PLAIN)/test_ipc $(PLAIN)/test_hub_seq $(PLAIN)/test_hub \
 		$(PLAIN)/test_backoff $(PLAIN)/test_role_args $(PLAIN)/test_multiproc \
 		$(PLAIN)/test_capture_fmt $(PLAIN)/test_capture $(PLAIN)/test_capture_faults \
-		$(PLAIN)/test_distance $(PLAIN)/test_reader_backend $(PLAIN)/test_multiproc_live \
-		$(PLAIN)/distance_probe $(PLAIN)/light_probe $(PLAIN)/openchair test-store
+		$(PLAIN)/test_distance $(PLAIN)/test_position $(PLAIN)/test_reader_backend \
+		$(PLAIN)/test_multiproc_live $(PLAIN)/distance_probe $(PLAIN)/light_probe $(PLAIN)/openchair test-store
 	./$(PLAIN)/test_smoke
 	./$(PLAIN)/test_sample
 	./$(PLAIN)/test_light
@@ -61,6 +61,7 @@ test: $(PLAIN)/test_smoke $(PLAIN)/test_sample $(PLAIN)/test_light $(PLAIN)/test
 	./$(PLAIN)/test_capture
 	./$(PLAIN)/test_capture_faults
 	./$(PLAIN)/test_distance
+	./$(PLAIN)/test_position
 	./$(PLAIN)/test_reader_backend
 	timeout $(MP_TIMEOUT) ./$(PLAIN)/test_multiproc_live
 
@@ -68,7 +69,8 @@ asan: $(ASAN)/test_smoke $(ASAN)/test_sample $(ASAN)/test_light $(ASAN)/test_i2c
 		$(ASAN)/test_ipc_msg $(ASAN)/test_ipc $(ASAN)/test_hub_seq $(ASAN)/test_hub \
 		$(ASAN)/test_backoff $(ASAN)/test_role_args $(ASAN)/test_multiproc \
 		$(ASAN)/test_capture_fmt $(ASAN)/test_capture $(ASAN)/test_capture_faults \
-		$(ASAN)/test_distance $(ASAN)/test_reader_backend $(ASAN)/test_multiproc_live \
+		$(ASAN)/test_distance $(ASAN)/test_position $(ASAN)/test_reader_backend \
+		$(ASAN)/test_multiproc_live \
 		$(ASAN)/openchair asan-store
 	ASAN_OPTIONS=detect_leaks=1:abort_on_error=0 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
 		./$(ASAN)/test_smoke
@@ -86,6 +88,7 @@ asan: $(ASAN)/test_smoke $(ASAN)/test_sample $(ASAN)/test_light $(ASAN)/test_i2c
 	$(ASAN_ENV) ./$(ASAN)/test_capture
 	$(ASAN_ENV) ./$(ASAN)/test_capture_faults
 	$(ASAN_ENV) ./$(ASAN)/test_distance
+	$(ASAN_ENV) ./$(ASAN)/test_position
 	$(ASAN_ENV) ./$(ASAN)/test_reader_backend
 	$(ASAN_ENV) OC_TEST_TIME_SCALE=$(ASAN_SCALE) timeout $(MP_TIMEOUT) ./$(ASAN)/test_multiproc_live
 
@@ -286,6 +289,19 @@ asan-distance: $(ASAN)/test_distance
 
 memcheck-distance: $(PLAIN)/test_distance
 	@command -v valgrind >/dev/null || { echo "memcheck-distance: valgrind not installed" >&2; exit 1; }
+	valgrind -q --error-exitcode=99 --leak-check=full --errors-for-leak-kinds=definite,possible ./$<
+
+# Placement/stability gate tests (pure computation; SIMULATED samples).
+.PHONY: test-position asan-position memcheck-position
+
+test-position: $(PLAIN)/test_position
+	./$<
+
+asan-position: $(ASAN)/test_position
+	$(ASAN_ENV) ./$<
+
+memcheck-position: $(PLAIN)/test_position
+	@command -v valgrind >/dev/null || { echo "memcheck-position: valgrind not installed" >&2; exit 1; }
 	valgrind -q --error-exitcode=99 --leak-check=full --errors-for-leak-kinds=definite,possible ./$<
 
 # Live VL6180X probe (docs/vl6180x.md). Builds anywhere; reads hardware only
