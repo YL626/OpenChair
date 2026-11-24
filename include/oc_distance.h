@@ -21,10 +21,21 @@
  * when the device produced one (error code in bits 7:4), otherwise 0. The
  * original negative errno is returned through io_errno.
  *
- * Recovery: the device is set up (oc_vl6180x_setup) on the first attempt and
- * again on the attempt after any failed one, so a sensor that was unplugged
- * and re-plugged (power-cycled, so its settings are gone) is brought back
- * without a restart. That attempt's setup is part of the sample attempt.
+ * Recovery: the device is set up (oc_vl6180x_setup) on the first attempt,
+ * and again on the attempt after
+ *   - any failed attempt (bus error, timeout, failed setup), so a sensor
+ *     that was unplugged and re-plugged is brought back without a restart;
+ *   - a range carrying a system error code (1-5): the chip reported a fault
+ *     of its own;
+ *   - a silent reset: every attempt on a set-up device first reads
+ *     SYSTEM__FRESH_OUT_OF_RESET (one extra bus read). A brownout, or an
+ *     unplug and replug between two attempts, resets the chip without any
+ *     failed transfer; without this check it would keep ranging without
+ *     ST's mandatory settings.
+ * Setup is part of the sample attempt it runs in (and of its timestamp).
+ *
+ * Stats: counters for logs and heartbeats (oc_distance_get_stats); they
+ * never wrap silently in practice (u32 at <= 20 attempts/s is > 6 years).
  *
  * Ownership: struct oc_distance owns no resources (see oc_vl6180x.h). */
 
@@ -33,11 +44,23 @@
 #include "oc_sample.h"
 #include "oc_vl6180x.h"
 
+struct oc_distance_stats {
+    uint32_t attempts;          /* sample attempts (== samples produced + clock failures) */
+    uint32_t setups;            /* setup runs, successful or not */
+    uint32_t setup_failures;
+    uint32_t silent_resets;     /* fresh-out-of-reset seen on a set-up device */
+    uint32_t system_errors;     /* ranges with error code 1-5 */
+    uint32_t io_failures;       /* attempts that ended in a bus error or timeout */
+    uint32_t range_errors[16];  /* completed ranges by error code (index 0 = valid) */
+};
+
 struct oc_distance {
     struct oc_vl6180x dev;
     uint32_t seq;      /* seq of the next sample */
     uint8_t origin;    /* copied from the bus at init */
-    bool set_up;       /* false until a setup succeeds, and after any failure */
+    bool set_up;       /* false until a setup succeeds, and after any failure,
+                          system error or detected reset */
+    struct oc_distance_stats stats;
 };
 
 /* -EINVAL for NULL/invalid arguments (see oc_vl6180x_init). No hardware access. */
@@ -53,5 +76,8 @@ uint8_t oc_distance_status_for_errno(int err);
  * only if the clock itself failed, because a sample without a timestamp must
  * not be fabricated; seq is still consumed. */
 int oc_distance_sample(struct oc_distance *dist, struct oc_sample *out, int *io_errno);
+
+/* Copies the counters. -EINVAL for NULL. */
+int oc_distance_get_stats(const struct oc_distance *dist, struct oc_distance_stats *out);
 
 #endif

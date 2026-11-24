@@ -726,6 +726,101 @@ static void test_distance_samples_survive_the_wire(void)
     }
 }
 
+/* A silent reset (brownout, or unplug and replug between two attempts) fails
+ * no transfer, so only the fresh-out-of-reset check can see it. The next
+ * attempt reloads the mandatory settings before ranging. */
+static void test_distance_silent_reset_detected(void)
+{
+    struct drig r;
+    drig_init(&r);
+    fv_push(&r.f, 10, 0);
+    fv_push(&r.f, 20, 0);
+    fv_push(&r.f, 30, 0);
+    struct oc_sample s;
+    CHECK(oc_distance_sample(&r.dist, &s, nullptr) == 0 && s.status == OC_ST_OK);
+    CHECK(r.f.private_writes == 28);
+
+    fv_power_on(&r.f);   /* reset with no failed transfer */
+    CHECK(oc_distance_sample(&r.dist, &s, nullptr) == 0);
+    CHECK(s.status == OC_ST_OK && s.value == 20);
+    CHECK(r.f.private_writes == 56);
+    CHECK(r.f.regs[0x0016] == 0x00 && r.f.regs[0x0014] == 0x24);
+
+    unsigned mark = r.f.calls;
+    CHECK(oc_distance_sample(&r.dist, &s, nullptr) == 0 && s.value == 30);
+    CHECK(r.f.private_writes == 56);   /* no further reload */
+    for (unsigned i = mark; i < r.f.calls; i++)
+        CHECK(!(r.f.log[i].read && r.f.log[i].reg == 0x0000));
+
+    struct oc_distance_stats st;
+    CHECK(oc_distance_get_stats(&r.dist, &st) == 0);
+    CHECK(st.silent_resets == 1 && st.setups == 2 && st.setup_failures == 0);
+}
+
+/* On a set-up device the first transfer of every attempt is the fresh check,
+ * before anything that could start a range. */
+static void test_distance_fresh_check_precedes_range(void)
+{
+    struct drig r;
+    drig_init(&r);
+    struct oc_sample s;
+    CHECK(oc_distance_sample(&r.dist, &s, nullptr) == 0);
+    for (int k = 0; k < 3; k++) {
+        unsigned mark = r.f.calls;
+        CHECK(oc_distance_sample(&r.dist, &s, nullptr) == 0 && s.status == OC_ST_OK);
+        CHECK(r.f.log[mark].read && r.f.log[mark].reg == 0x0016);
+        CHECK(r.f.calls - mark == 8);   /* fresh check + the 7 range transfers */
+    }
+}
+
+/* A range carrying a system error code (1-5) is reported as RANGE_ERR with
+ * the raw byte, and the next attempt sets the device up again. */
+static void test_distance_system_error_forces_setup(void)
+{
+    struct drig r;
+    drig_init(&r);
+    fv_push(&r.f, 0, 4);
+    fv_push(&r.f, 33, 0);
+    struct oc_sample s;
+    CHECK(oc_distance_sample(&r.dist, &s, nullptr) == 0);
+    CHECK(s.status == OC_ST_RANGE_ERR && s.value == 0 && s.aux == (4u << 4 | 0x01u));
+    unsigned mark = r.f.calls;
+    CHECK(oc_distance_sample(&r.dist, &s, nullptr) == 0);
+    CHECK(s.status == OC_ST_OK && s.value == 33);
+    CHECK(r.f.log[mark].read && r.f.log[mark].reg == 0x0000);   /* setup ran first */
+    struct oc_distance_stats st;
+    CHECK(oc_distance_get_stats(&r.dist, &st) == 0);
+    CHECK(st.system_errors == 1 && st.setups == 2 && st.range_errors[4] == 1);
+}
+
+static void test_distance_stats_count_outcomes(void)
+{
+    struct drig r;
+    drig_init(&r);
+    fv_push(&r.f, 50, 0);
+    fv_push(&r.f, 255, 11);
+    fv_push(&r.f, 51, 0);
+    struct oc_sample s;
+    CHECK(oc_distance_sample(&r.dist, &s, nullptr) == 0);   /* setup + OK */
+    CHECK(oc_distance_sample(&r.dist, &s, nullptr) == 0);   /* SNR */
+    r.f.unplugged = true;
+    CHECK(oc_distance_sample(&r.dist, &s, nullptr) == 0);   /* fresh check NACKs */
+    CHECK(oc_distance_sample(&r.dist, &s, nullptr) == 0);   /* setup NACKs */
+    r.f.unplugged = false;
+    CHECK(oc_distance_sample(&r.dist, &s, nullptr) == 0);   /* setup + OK */
+    CHECK(s.status == OC_ST_OK && s.value == 51);
+
+    struct oc_distance_stats st;
+    CHECK(oc_distance_get_stats(&r.dist, &st) == 0);
+    CHECK(st.attempts == 5);
+    CHECK(st.setups == 3 && st.setup_failures == 1);
+    CHECK(st.io_failures == 2);
+    CHECK(st.range_errors[0] == 2 && st.range_errors[11] == 1);
+    CHECK(st.system_errors == 0 && st.silent_resets == 0);
+    CHECK(oc_distance_get_stats(nullptr, &st) == -EINVAL);
+    CHECK(oc_distance_get_stats(&r.dist, nullptr) == -EINVAL);
+}
+
 int main(void)
 {
     RUN(test_init_validates_before_hardware);
@@ -762,6 +857,10 @@ int main(void)
     RUN(test_distance_origin_fixed_at_init);
     RUN(test_distance_clock_failure_is_not_fabricated);
     RUN(test_distance_samples_survive_the_wire);
+    RUN(test_distance_silent_reset_detected);
+    RUN(test_distance_fresh_check_precedes_range);
+    RUN(test_distance_system_error_forces_setup);
+    RUN(test_distance_stats_count_outcomes);
 
     if (failures != 0) {
         fprintf(stderr, "test_distance: %d check(s) failed\n", failures);
