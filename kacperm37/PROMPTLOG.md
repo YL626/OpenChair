@@ -384,3 +384,133 @@ Six commits on `kacperm37-impl`. Each was verified with `make test-store`, `make
 - **No VL6180X reading exists yet.** Next is running `docs/vl6180x.md` §4 on the Pi (i2cdetect, three probe runs, dmesg) and committing the raw output.
 - **For Alan's review:** `aux` = the raw range-status byte; the errno table is duplicated from `oc_light`; re-setup after a failure.
 - **Not started:** the distance reader *process* (HELLO, IPC, heartbeats). It depends on Mechanism E.
+
+---
+
+## Session 2026-11-23: completing the VL6180X distance reader (from "bare minimum" to full)
+
+- **Raw transcript:** `~/.claude/projects/-home-kacper-Documents-OpenChair/d81bacf4-d900-4a72-8f69-57c5f2ace5b9.jsonl`. Copy it unedited into `kacperm37/transcripts/` at the milestone (CLAUDE.md, "Claude transcript requirements").
+- **Model:** Claude Opus 5.5 (Claude Code CLI).
+- **Branch:** `kacperm37-vl6180x-full`, created by Claude from `main` at `16afc6b` (after Alan's PR #31).
+
+### Episode 1: Finding my old "bare minimum" direction
+
+**Prompt:**
+
+> Take a look at what I've asked you to do in the past through claude history as well as every file in Documents/OpenChairExtra, that being the term project file itself, as well as the ELI15 helpers that I've asked to make with each feature/sensor implemented. I remember asking you to implement a sensor only as far as you needed to for things to go green, but not the full sensor. Could you see my directions of that?
+
+**What Claude did:**
+
+- Searched `~/.claude/history.jsonl`, the three earlier OpenChair transcripts, this PROMPTLOG and the five PDFs in `~/Documents/OpenChairExtra` (it extracted their text with `pdftotext`).
+- Reported that **no instruction is worded "only as far as needed to go green / not the full sensor"**. Three come close:
+  1. **VL6180X, 2026-10-29:** "I need to implement the bare minimum to read live input from the VL6180X distance reader". This is the only sensor request, and its target was live input, not green tests.
+  2. **`oc_store`, 2026-10-28:** "what gets the tests passing". That was storage, not a sensor.
+  3. **The red-first tests, 2026-10-25.**
+- Its guess was that I was blending #1 and #2. It quoted the VL6180X ELI15's own "what's not done" list as the scope that had been left out.
+
+### My thoughts:
+<!-- Kacper: your thoughts here. -->
+
+---
+
+### Episode 2: Planning the full implementation
+
+**Prompt:**
+
+> Yes! Could you please take a look at the "bare minimum" implementation to read live input from the VL6180X distance reader, and make sure things are all flushed out this time? I needed bare minimum to pass a demo, but now I need to implement it fully. If you plan on making changes, could you please keep up the trend of the PROMPTLOG and put in everything in there including a "My thoughts" section? Could you then also make an updated ELI15 for anything you change that might already be in a previous ELI15?
+
+**What Claude did (plan mode, read-only):**
+
+- Read the driver, adapter, fake, tests, probe, `docs/vl6180x.md`, DESIGN.md, IMPLEMENTATION_NOTES.md, Alan's M3-B backend (`oc_reader_backend.c`, which already runs the adapter in the reader process), and the spec's sensor and demo-day sections.
+- **Checked the register facts that the first session had marked "[REVIEW] from memory".** It used a fetch agent to read three public sources:
+  - Adafruit_VL6180X: every address and all 30 AN4545 private settings are **identical** to ours.
+  - The Linux kernel's `vl6180.c` and Pololu's `vl6180x-arduino`: the addresses agree.
+  - One discrepancy: Pololu has `0x0E3=0x01, 0x0E4=0x03`, where Adafruit and we have `0x00, 0x04`. This stays [REVIEW].
+  - None of the sources confirmed the error bits 7:6 of `RESULT__INTERRUPT_STATUS_GPIO`, so Claude left them out rather than invent their meaning.
+- **Gaps it listed:**
+  - settings that were assumed rather than written (max convergence, which the 100 ms deadline rests on; 1x scaling; interleaved mode), with no readback;
+  - a reset without a failed transfer (brownout, quick replug) going unnoticed, so the chip would range without ST's settings;
+  - chip-fault codes 1–5 not triggering re-setup, and no error names;
+  - no placement/stability check (CLAUDE.md requires one);
+  - no calibration;
+  - the probe reporting only a max, not distributions;
+  - stale docs.
+- **Asked four questions. My answers:**
+  - *Placement check (fusion is Alan's per DESIGN.md §7):* "Build it, Alan reviews, but make sure this decision is indicated somewhere, so when his claude runs through the documentation or the code base, it picks it up and asks him for the review personally If we can force this review simply through the github PR then ignore the instuctions after the "but". The PROMPTLOG and ELI15 rule still applies."
+  - *Calibration:* offset plus a probe calibrate mode.
+  - *Commits:* a new branch with staged commits.
+  - *Live data from the demo:* "Yes, and the video is in Videos/Kacper_Alan_HardwareDemo.MOV".
+- **On forcing the review through GitHub:** a PR can *request* a review, but *requiring* one needs branch protection with code owners on `YL626/OpenChair`, which only the repo owner can turn on. So Claude did both:
+  - a "PENDING CROSS-OWNER REVIEW" note in CLAUDE.md, which every Claude session loads;
+  - `[REVIEW: Alan]` markers in the header and the docs;
+  - the PR should still request YL626.
+- Plan file: `~/.claude/plans/take-a-look-at-sleepy-cosmos-of-d81bacf4-d900-4a72-8f69-57c5f2ace5b9.md`. I approved it.
+
+### My thoughts:
+<!-- Kacper: your thoughts here. -->
+
+---
+
+### Episode 3: What the demo video shows
+
+**What Claude did:**
+
+- Extracted 1 fps frames (`ffmpeg`, into the scratchpad) and read the terminal at full resolution. The video was filmed 2026-10-30 at 11:53 and shows `./m3_demo.sh` over SSH to the Pi.
+- **Readable on screen** (an observation from a phone video, *not* raw log evidence):
+  - `CAPRESULT verdict=PASS origin=LIVE window_ms=30000 appended=1701 durable=1701 uncertain=0`;
+  - `CAPSRC src=distance accepted=201 ok=201 fail=0 non_ok=0 gaps=0`;
+  - `SUMMARY role=distance origin=LIVE attempted=239 sent=239 overruns=0`;
+  - the light reader had 1500 OK samples;
+  - the log directory was `m3-live-2026-10-30-115327/`.
+- **What it means:**
+  - The first driver did work LIVE.
+  - 201 samples in 30 s is about 6.7/s, which matches the reader's 150 ms period and is below DESIGN.md's 10–20/s target. That was flagged for Alan, not changed.
+  - No millimetre value or attempt time is visible, so every threshold stays [MEASURE].
+- The video is **not committed**: its metadata includes GPS coordinates. The raw `m3-live-…` logs should be copied off the Pi instead.
+
+### My thoughts:
+<!-- Kacper: your thoughts here. -->
+
+---
+
+### Episode 4: Implementation commits
+
+| Commit | What |
+|---|---|
+| `7e1f14d` | **Driver.** Explicit config (max convergence 49 ms, interleaved off, 1x scaling) with readback, where a mismatch or a fresh flag that won't clear gives `-EPROTO`. Also `oc_vl6180x_fresh_out_of_reset()`, error-code names plus `is_system()` for codes 1–5, and the offset (FACTORY by default, which writes nothing; SET is verified), `read_offset()` and a pure `offset_suggest()`. Fake extended. 8 new tests, 34 in total. |
+| `38ab896` | **Adapter.** Fresh-check before each attempt (silent reset leads to re-setup); chip fault leads to re-setup while staying RANGE_ERR with the raw `aux`; `oc_distance_stats`. 4 new tests, 38 in total. |
+| `4e57e6d` | **`oc_position`** placement/stability gate, `[REVIEW: Alan]`, not wired into the hub. 15 tests; Makefile targets. |
+| `d13b036` | **Probe and docs.** `--offset`/`--calibrate`; `range_err` and `position` columns; distributions in the summary. `docs/vl6180x.md` rewritten, IMPLEMENTATION_NOTES §9d, README rows, CLAUDE.md review note. |
+
+The plan had a separate offset commit. Claude folded it into the driver commit because both changes are in the same two files.
+
+**Evidence, before every commit:** `make clean && make && make test && make asan && make memcheck && make memcheck-distance` (plus `memcheck-position` from commit 3). All exit codes were 0, with no `FAIL`, ASan or UBSan lines in the logs.
+
+**Mutation checks (each must make a test fail):**
+
+- **Driver: 10 of 10 caught.** No readback compare; no fresh re-check; verifying the self-clearing VHV trigger; no max-convergence write; offset readback ignored; offset always written; wrong sign in the suggestion; `>` changed to `>=` on spread; a wrong error name.
+- **Adapter: 6 of 6 caught.** No fresh check; no re-setup on a chip fault; no re-setup after a failure; and three stats counters dropped.
+  - "No re-setup after a failure" is now caught by only 1 check. The fresh check also catches a replug, so the two mechanisms back each other up.
+- **`oc_position`: 11 of 11 caught.** Spread compare; no gap reset; no time check; `>` versus `>=` on time; non-OK keeps the window; no staleness; upper bound skipped; no MIXED; wrong median index; FAULT shown as NO_TARGET; SETTLING skipped.
+- **Two first attempts proved nothing.** "No readback" deleted the call, so the compiler refused to build (an unused function). "Verify everything" passed because the fake stored the VHV trigger instead of clearing it. Claude made the fake model the self-clearing trigger and re-ran both; both are now caught.
+
+**Probe.**
+- Checked here only for its argument errors and open failures (exit 2).
+- Its summary and calibration code was run through a scratch harness on the fake sensor. The harness is not committed. Results:
+  - mean 47.1 and stddev 0.6 (Python's `pstdev` gives 0.64);
+  - suggested offset +1 from a factory offset of −2 at a 50 mm target.
+- It was **deliberately not run against this laptop's real I2C buses**, unlike last session's accidental run.
+
+**Not changed (Alan's code):** the 150 ms LIVE period; an offset flag for `--role distance`; printing the new stats in STAT/heartbeats; README text that still says "no LIVE reading has been taken on the Pi".
+
+### My thoughts:
+<!-- Kacper: your thoughts here. -->
+
+---
+
+### State at the end of this session
+
+- **Branch `kacperm37-vl6180x-full`:** 4 code/docs commits and this PROMPTLOG commit. Not pushed; I open the PR and **request review from YL626**.
+- **Host-tested only.** On the Pi, run `docs/vl6180x.md` §4, **starting with step 2a**: the new readback must pass on the real part. If every row is IO_ERR with `errno=Protocol error`, the readback disagrees with the hardware, and that has to be fixed before the reader is used again.
+- **Waiting on Alan:** `oc_position` (API, use in fusion, defaults), and the items in `docs/vl6180x.md` §6.
+- **ELI15:** `~/Documents/OpenChairExtra/OpenChair-vl6180x-full-ELI15.pdf`, the updated version of the first VL6180X ELI15.
