@@ -101,7 +101,7 @@ static void test_setup_fresh_device(void)
     struct rig r;
     rig_init(&r);
     CHECK(oc_vl6180x_setup(&r.d) == 0);
-    CHECK(r.f.private_writes == 30);
+    CHECK(r.f.private_writes == 28);   /* 30 settings; the fake counts RANGE_SCALER apart */
     CHECK(r.f.regs[0x0207] == 0x01 && r.f.regs[0x0097] == 0xFD && r.f.regs[0x0030] == 0x00);
     CHECK(r.f.regs[0x0016] == 0x00);          /* fresh-out-of-reset cleared */
     CHECK(r.f.regs[0x0014] == 0x24);          /* "new sample ready" interrupt */
@@ -149,6 +149,196 @@ static void test_setup_bus_errors_pass_through(void)
     rig_init(&r);
     r.f.unplugged = true;
     CHECK(oc_vl6180x_setup(&r.d) == -ENXIO);
+}
+
+/* Index of the first logged register read of reg at or after index from, or -1. */
+static int find_read_from(const struct fv *f, uint16_t reg, int from)
+{
+    for (unsigned i = (unsigned)(from < 0 ? 0 : from); i < f->calls && i < FV_MAX_LOG; i++)
+        if (f->log[i].read && f->log[i].reg == reg)
+            return (int)i;
+    return -1;
+}
+
+static const uint16_t verified_regs[] = {
+    0x0011, 0x010A, 0x0031, 0x0014, 0x001C, 0x02A3, 0x0096, 0x0097,
+};
+
+/* Every ranging setting the driver relies on is written explicitly, also on
+ * a device that is not fresh and was left with other values, and each one is
+ * read back after it was written. */
+static void test_setup_writes_and_verifies_ranging_config(void)
+{
+    struct rig r;
+    rig_init(&r);
+    r.f.regs[0x0016] = 0x00;   /* not fresh: someone else configured it */
+    r.f.regs[0x001C] = 0x3F;   /* longer convergence */
+    r.f.regs[0x02A3] = 0x01;   /* interleaved mode on */
+    r.f.regs[0x0096] = 0x00;
+    r.f.regs[0x0097] = 0x7F;   /* 2x scaling */
+    CHECK(oc_vl6180x_setup(&r.d) == 0);
+    CHECK(r.f.private_writes == 0);
+    CHECK(r.f.regs[0x001C] == 0x31);
+    CHECK(r.f.regs[0x02A3] == 0x00);
+    CHECK(r.f.regs[0x0096] == 0x00 && r.f.regs[0x0097] == 0xFD);
+    CHECK(r.f.regs[0x0011] == 0x10 && r.f.regs[0x010A] == 0x30 && r.f.regs[0x0031] == 0xFF);
+    CHECK(r.f.vhv_recalibrations == 1);   /* triggered, and not "verified" (it self-clears) */
+    for (size_t i = 0; i < sizeof verified_regs / sizeof verified_regs[0]; i++) {
+        int w = find_write(&r.f, verified_regs[i]);
+        CHECK(w >= 0);
+        CHECK(find_read_from(&r.f, verified_regs[i], w + 1) > w);
+    }
+    /* the fresh flag is re-read last, after the settings */
+    int last_fresh = -1;
+    for (unsigned i = 0; i < r.f.calls; i++)
+        if (r.f.log[i].read && r.f.log[i].reg == 0x0016)
+            last_fresh = (int)i;
+    CHECK(last_fresh == (int)r.f.calls - 1);
+}
+
+/* A setting that does not read back as written fails setup with -EPROTO; the
+ * self-clearing VHV recalibration trigger is not checked. */
+static void test_setup_readback_mismatch_is_eproto(void)
+{
+    for (size_t i = 0; i < sizeof verified_regs / sizeof verified_regs[0]; i++) {
+        struct rig r;
+        rig_init(&r);
+        r.f.corrupt_reg = verified_regs[i];
+        CHECK(oc_vl6180x_setup(&r.d) == -EPROTO);
+    }
+    struct rig r;
+    rig_init(&r);
+    r.f.corrupt_reg = 0x002E;
+    CHECK(oc_vl6180x_setup(&r.d) == 0);
+}
+
+/* If the fresh-out-of-reset flag does not stay cleared, reset detection would
+ * be blind, so setup refuses. */
+static void test_setup_fresh_flag_must_clear(void)
+{
+    struct rig r;
+    rig_init(&r);
+    r.f.fresh_sticks = true;
+    CHECK(oc_vl6180x_setup(&r.d) == -EPROTO);
+}
+
+static void test_fresh_out_of_reset_reads_flag(void)
+{
+    struct rig r;
+    rig_init(&r);
+    bool fresh = false;
+    CHECK(oc_vl6180x_fresh_out_of_reset(&r.d, &fresh) == 0 && fresh);
+    CHECK(oc_vl6180x_setup(&r.d) == 0);
+    CHECK(oc_vl6180x_fresh_out_of_reset(&r.d, &fresh) == 0 && !fresh);
+    fv_power_on(&r.f);   /* silent reset: no failed transfer in between */
+    CHECK(oc_vl6180x_fresh_out_of_reset(&r.d, &fresh) == 0 && fresh);
+    r.f.unplugged = true;
+    fresh = false;
+    CHECK(oc_vl6180x_fresh_out_of_reset(&r.d, &fresh) == -ENXIO && !fresh);
+    CHECK(oc_vl6180x_fresh_out_of_reset(nullptr, &fresh) == -EINVAL);
+    CHECK(oc_vl6180x_fresh_out_of_reset(&r.d, nullptr) == -EINVAL);
+}
+
+static void test_range_error_names(void)
+{
+    static const char *const want[16] = {
+        "NONE", "SYSERR_1", "SYSERR_2", "SYSERR_3", "SYSERR_4", "SYSERR_5",
+        "ECE_FAIL", "NO_CONVERGE", "RANGE_IGNORE", "UNDEFINED_9", "UNDEFINED_10",
+        "SNR", "RAW_UFLOW", "RAW_OFLOW", "RANGE_UFLOW", "RANGE_OFLOW",
+    };
+    for (uint8_t c = 0; c < 16; c++) {
+        CHECK(strcmp(oc_vl6180x_range_error_name(c), want[c]) == 0);
+        CHECK(oc_vl6180x_range_error_is_system(c) == (c >= 1 && c <= 5));
+    }
+    CHECK(strcmp(oc_vl6180x_range_error_name(16), "?") == 0);
+    CHECK(strcmp(oc_vl6180x_range_error_name(255), "?") == 0);
+    CHECK(!oc_vl6180x_range_error_is_system(16));
+}
+
+/* ---- driver: offset calibration ---- */
+
+/* FACTORY (the default) never writes the offset register. */
+static void test_offset_factory_writes_nothing(void)
+{
+    struct rig r;
+    rig_init(&r);
+    r.f.factory_offset = -3;
+    fv_power_on(&r.f);
+    CHECK(oc_vl6180x_setup(&r.d) == 0);
+    CHECK(find_write(&r.f, 0x0024) < 0);
+    int8_t off = 0;
+    CHECK(oc_vl6180x_read_offset(&r.d, &off) == 0 && off == -3);
+    CHECK(oc_vl6180x_read_offset(nullptr, &off) == -EINVAL);
+    CHECK(oc_vl6180x_read_offset(&r.d, nullptr) == -EINVAL);
+}
+
+/* SET writes the two's complement value and verifies it by readback. */
+static void test_offset_set_written_and_verified(void)
+{
+    struct rig r;
+    fv_init(&r.f);
+    fv_bus(&r.f, &r.bus, &r.clk);
+    r.cfg = (struct oc_vl6180x_cfg){.addr = 0x29, .offset_mode = OC_VL6180X_OFFSET_SET,
+                                    .offset_mm = -5};
+    CHECK(oc_vl6180x_init(&r.d, &r.bus, &r.clk, &r.cfg) == 0);
+    CHECK(oc_vl6180x_setup(&r.d) == 0);
+    CHECK(r.f.regs[0x0024] == 0xFB);
+    int8_t off = 0;
+    CHECK(oc_vl6180x_read_offset(&r.d, &off) == 0 && off == -5);
+
+    fv_power_on(&r.f);
+    r.f.corrupt_reg = 0x0024;
+    CHECK(oc_vl6180x_setup(&r.d) == -EPROTO);
+
+    struct oc_vl6180x d;
+    r.cfg.offset_mode = 2;
+    CHECK(oc_vl6180x_init(&d, &r.bus, &r.clk, &r.cfg) == -EINVAL);
+}
+
+static void fill(uint8_t *a, size_t n, uint8_t v)
+{
+    for (size_t i = 0; i < n; i++)
+        a[i] = v;
+}
+
+static void test_offset_suggest(void)
+{
+    uint8_t mm[20];
+    struct oc_vl6180x_offset_fit fit;
+
+    fill(mm, 10, 47);   /* reads 3 mm short at a 50 mm target */
+    CHECK(oc_vl6180x_offset_suggest(50, mm, 10, 0, &fit) == 0);
+    CHECK(fit.suggested_mm == 3 && fit.mean_x10_mm == 470 && fit.spread_mm == 0 && fit.n == 10);
+    CHECK(oc_vl6180x_offset_suggest(50, mm, 10, -2, &fit) == 0 && fit.suggested_mm == 1);
+
+    fill(mm, 10, 47);   /* mean 47.5: +2.5 rounds away from zero to +3 */
+    fill(mm, 5, 48);
+    CHECK(oc_vl6180x_offset_suggest(50, mm, 10, 0, &fit) == 0);
+    CHECK(fit.mean_x10_mm == 475 && fit.suggested_mm == 3 && fit.spread_mm == 1);
+    fill(mm, 10, 52);   /* mean 52.5: -2.5 rounds to -3 */
+    fill(mm, 5, 53);
+    CHECK(oc_vl6180x_offset_suggest(50, mm, 10, 0, &fit) == 0 && fit.suggested_mm == -3);
+
+    fill(mm, 20, 50);
+    CHECK(oc_vl6180x_offset_suggest(50, mm, OC_VL6180X_CAL_MIN_SAMPLES - 1, 0, &fit) == -ENODATA);
+    mm[3] = 50 + OC_VL6180X_CAL_MAX_SPREAD_MM + 1;   /* the target moved */
+    CHECK(oc_vl6180x_offset_suggest(50, mm, 20, 0, &fit) == -EDOM);
+    CHECK(fit.spread_mm == OC_VL6180X_CAL_MAX_SPREAD_MM + 1);
+    mm[3] = 50 + OC_VL6180X_CAL_MAX_SPREAD_MM;       /* exactly at the limit is accepted */
+    CHECK(oc_vl6180x_offset_suggest(50, mm, 20, 0, &fit) == 0);
+
+    fill(mm, 10, 5);    /* 250 mm short with +127 already applied: does not fit int8 */
+    CHECK(oc_vl6180x_offset_suggest(255, mm, 10, 127, &fit) == -ERANGE && fit.suggested_mm == 0);
+    fill(mm, 10, 255);
+    CHECK(oc_vl6180x_offset_suggest(1, mm, 10, -128, &fit) == -ERANGE);
+    fill(mm, 10, 177);  /* -127 from 0 is the lowest that still fits... */
+    CHECK(oc_vl6180x_offset_suggest(50, mm, 10, 0, &fit) == 0 && fit.suggested_mm == -127);
+    fill(mm, 10, 179);  /* ...and -129 does not */
+    CHECK(oc_vl6180x_offset_suggest(50, mm, 10, 0, &fit) == -ERANGE);
+
+    CHECK(oc_vl6180x_offset_suggest(0, mm, 10, 0, &fit) == -EINVAL);
+    CHECK(oc_vl6180x_offset_suggest(50, nullptr, 10, 0, &fit) == -EINVAL);
+    CHECK(oc_vl6180x_offset_suggest(50, mm, 10, 0, nullptr) == -EINVAL);
 }
 
 /* ---- driver: ranging ---- */
@@ -465,7 +655,7 @@ static void test_distance_unplug_and_replug_recovers(void)
     fv_push(&r.f, 20, 0);
     struct oc_sample s;
     CHECK(oc_distance_sample(&r.dist, &s, nullptr) == 0 && s.status == OC_ST_OK);
-    CHECK(r.f.private_writes == 30);
+    CHECK(r.f.private_writes == 28);
 
     r.f.unplugged = true;
     for (int i = 0; i < 3; i++) {
@@ -477,7 +667,7 @@ static void test_distance_unplug_and_replug_recovers(void)
     fv_power_on(&r.f);   /* re-plugged: power-cycled, settings gone */
     CHECK(oc_distance_sample(&r.dist, &s, nullptr) == 0);
     CHECK(s.status == OC_ST_OK && s.value == 20);
-    CHECK(r.f.private_writes == 60);    /* mandatory settings reloaded */
+    CHECK(r.f.private_writes == 56);    /* mandatory settings reloaded */
     CHECK(r.f.regs[0x0016] == 0x00);
     CHECK(r.f.regs[0x0014] == 0x24);
 }
@@ -536,6 +726,101 @@ static void test_distance_samples_survive_the_wire(void)
     }
 }
 
+/* A silent reset (brownout, or unplug and replug between two attempts) fails
+ * no transfer, so only the fresh-out-of-reset check can see it. The next
+ * attempt reloads the mandatory settings before ranging. */
+static void test_distance_silent_reset_detected(void)
+{
+    struct drig r;
+    drig_init(&r);
+    fv_push(&r.f, 10, 0);
+    fv_push(&r.f, 20, 0);
+    fv_push(&r.f, 30, 0);
+    struct oc_sample s;
+    CHECK(oc_distance_sample(&r.dist, &s, nullptr) == 0 && s.status == OC_ST_OK);
+    CHECK(r.f.private_writes == 28);
+
+    fv_power_on(&r.f);   /* reset with no failed transfer */
+    CHECK(oc_distance_sample(&r.dist, &s, nullptr) == 0);
+    CHECK(s.status == OC_ST_OK && s.value == 20);
+    CHECK(r.f.private_writes == 56);
+    CHECK(r.f.regs[0x0016] == 0x00 && r.f.regs[0x0014] == 0x24);
+
+    unsigned mark = r.f.calls;
+    CHECK(oc_distance_sample(&r.dist, &s, nullptr) == 0 && s.value == 30);
+    CHECK(r.f.private_writes == 56);   /* no further reload */
+    for (unsigned i = mark; i < r.f.calls; i++)
+        CHECK(!(r.f.log[i].read && r.f.log[i].reg == 0x0000));
+
+    struct oc_distance_stats st;
+    CHECK(oc_distance_get_stats(&r.dist, &st) == 0);
+    CHECK(st.silent_resets == 1 && st.setups == 2 && st.setup_failures == 0);
+}
+
+/* On a set-up device the first transfer of every attempt is the fresh check,
+ * before anything that could start a range. */
+static void test_distance_fresh_check_precedes_range(void)
+{
+    struct drig r;
+    drig_init(&r);
+    struct oc_sample s;
+    CHECK(oc_distance_sample(&r.dist, &s, nullptr) == 0);
+    for (int k = 0; k < 3; k++) {
+        unsigned mark = r.f.calls;
+        CHECK(oc_distance_sample(&r.dist, &s, nullptr) == 0 && s.status == OC_ST_OK);
+        CHECK(r.f.log[mark].read && r.f.log[mark].reg == 0x0016);
+        CHECK(r.f.calls - mark == 8);   /* fresh check + the 7 range transfers */
+    }
+}
+
+/* A range carrying a system error code (1-5) is reported as RANGE_ERR with
+ * the raw byte, and the next attempt sets the device up again. */
+static void test_distance_system_error_forces_setup(void)
+{
+    struct drig r;
+    drig_init(&r);
+    fv_push(&r.f, 0, 4);
+    fv_push(&r.f, 33, 0);
+    struct oc_sample s;
+    CHECK(oc_distance_sample(&r.dist, &s, nullptr) == 0);
+    CHECK(s.status == OC_ST_RANGE_ERR && s.value == 0 && s.aux == (4u << 4 | 0x01u));
+    unsigned mark = r.f.calls;
+    CHECK(oc_distance_sample(&r.dist, &s, nullptr) == 0);
+    CHECK(s.status == OC_ST_OK && s.value == 33);
+    CHECK(r.f.log[mark].read && r.f.log[mark].reg == 0x0000);   /* setup ran first */
+    struct oc_distance_stats st;
+    CHECK(oc_distance_get_stats(&r.dist, &st) == 0);
+    CHECK(st.system_errors == 1 && st.setups == 2 && st.range_errors[4] == 1);
+}
+
+static void test_distance_stats_count_outcomes(void)
+{
+    struct drig r;
+    drig_init(&r);
+    fv_push(&r.f, 50, 0);
+    fv_push(&r.f, 255, 11);
+    fv_push(&r.f, 51, 0);
+    struct oc_sample s;
+    CHECK(oc_distance_sample(&r.dist, &s, nullptr) == 0);   /* setup + OK */
+    CHECK(oc_distance_sample(&r.dist, &s, nullptr) == 0);   /* SNR */
+    r.f.unplugged = true;
+    CHECK(oc_distance_sample(&r.dist, &s, nullptr) == 0);   /* fresh check NACKs */
+    CHECK(oc_distance_sample(&r.dist, &s, nullptr) == 0);   /* setup NACKs */
+    r.f.unplugged = false;
+    CHECK(oc_distance_sample(&r.dist, &s, nullptr) == 0);   /* setup + OK */
+    CHECK(s.status == OC_ST_OK && s.value == 51);
+
+    struct oc_distance_stats st;
+    CHECK(oc_distance_get_stats(&r.dist, &st) == 0);
+    CHECK(st.attempts == 5);
+    CHECK(st.setups == 3 && st.setup_failures == 1);
+    CHECK(st.io_failures == 2);
+    CHECK(st.range_errors[0] == 2 && st.range_errors[11] == 1);
+    CHECK(st.system_errors == 0 && st.silent_resets == 0);
+    CHECK(oc_distance_get_stats(nullptr, &st) == -EINVAL);
+    CHECK(oc_distance_get_stats(&r.dist, nullptr) == -EINVAL);
+}
+
 int main(void)
 {
     RUN(test_init_validates_before_hardware);
@@ -543,6 +828,14 @@ int main(void)
     RUN(test_setup_not_fresh);
     RUN(test_setup_wrong_model_id);
     RUN(test_setup_bus_errors_pass_through);
+    RUN(test_setup_writes_and_verifies_ranging_config);
+    RUN(test_setup_readback_mismatch_is_eproto);
+    RUN(test_setup_fresh_flag_must_clear);
+    RUN(test_fresh_out_of_reset_reads_flag);
+    RUN(test_range_error_names);
+    RUN(test_offset_factory_writes_nothing);
+    RUN(test_offset_set_written_and_verified);
+    RUN(test_offset_suggest);
     RUN(test_range_transactions);
     RUN(test_range_uses_configured_address);
     RUN(test_range_waits_for_new_sample);
@@ -564,6 +857,10 @@ int main(void)
     RUN(test_distance_origin_fixed_at_init);
     RUN(test_distance_clock_failure_is_not_fabricated);
     RUN(test_distance_samples_survive_the_wire);
+    RUN(test_distance_silent_reset_detected);
+    RUN(test_distance_fresh_check_precedes_range);
+    RUN(test_distance_system_error_forces_setup);
+    RUN(test_distance_stats_count_outcomes);
 
     if (failures != 0) {
         fprintf(stderr, "test_distance: %d check(s) failed\n", failures);

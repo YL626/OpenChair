@@ -48,7 +48,14 @@ struct fv {
     struct fv_meas latched;   /* result of the last completed range */
     unsigned starts;
     unsigned early_value_reads;   /* range value read while not "new sample ready" */
-    unsigned private_writes;      /* writes to the AN4545 private settings */
+    unsigned private_writes;      /* writes to AN4545 private registers, except
+                                     RANGE_SCALER (0x0096/0x0097), which setup
+                                     also writes on every call */
+    int8_t factory_offset;        /* SYSRANGE__PART_TO_PART_RANGE_OFFSET at power-on */
+    uint16_t corrupt_reg;         /* nonzero: reads of this register return the
+                                     stored value with bit 0 flipped */
+    bool fresh_sticks;            /* writes to SYSTEM__FRESH_OUT_OF_RESET are ignored */
+    unsigned vhv_recalibrations;  /* VHV recalibrations triggered */
 
     /* error injection: the fail_call-th xfer (1-based) fails with fail_errno */
     unsigned fail_call;
@@ -66,12 +73,15 @@ struct fv {
     int now_errno;
 };
 
-/* Power-on state: model ID, fresh out of reset, device ready, no settings. */
+/* Power-on state: model ID, fresh out of reset, device ready, no settings
+ * except the factory offset and the default max convergence time. */
 static void fv_power_on(struct fv *f)
 {
     memset(f->regs, 0, sizeof f->regs);
     f->regs[0x0000] = f->model_id;
     f->regs[0x0016] = 0x01;   /* SYSTEM__FRESH_OUT_OF_RESET */
+    f->regs[0x001C] = 0x31;   /* SYSRANGE__MAX_CONVERGENCE_TIME default */
+    f->regs[0x0024] = (uint8_t)f->factory_offset;
     f->measuring = false;
     f->int_status = 0;
 }
@@ -92,8 +102,14 @@ static bool fv_is_private_reg(uint16_t reg)
 
 static void fv_write(struct fv *f, uint16_t reg, uint8_t v)
 {
-    if (fv_is_private_reg(reg))
+    if (fv_is_private_reg(reg) && reg != 0x0096 && reg != 0x0097)
         f->private_writes++;
+    if (reg == 0x0016 && f->fresh_sticks)
+        return;
+    if (reg == 0x002E) {                 /* SYSRANGE__VHV_RECALIBRATE: self-clearing */
+        f->vhv_recalibrations += v & 0x01u;
+        return;                          /* modelled as finishing at once: reads 0 */
+    }
     if (reg == 0x0015) {                 /* SYSTEM__INTERRUPT_CLEAR */
         if (v & 0x01)
             f->int_status = 0;
@@ -142,6 +158,8 @@ static uint8_t fv_read(struct fv *f, uint16_t reg)
             f->early_value_reads++;
         return f->latched.mm;
     default:
+        if (f->corrupt_reg != 0 && reg == f->corrupt_reg)
+            return f->regs[reg] ^ 0x01u;
         return f->regs[reg];
     }
 }
